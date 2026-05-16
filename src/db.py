@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .schemas import (
+    CodeArtifact,
     Concept,
     ConceptLink,
     Conjecture,
@@ -318,16 +319,39 @@ def create_tables(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(paper_id) REFERENCES papers(id)
         );
 
+        CREATE TABLE IF NOT EXISTS code_artifacts (
+            artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL,
+            artifact_type TEXT NOT NULL,
+            description TEXT,
+            related_concepts TEXT NOT NULL,
+            related_conjectures TEXT NOT NULL,
+            tests_path TEXT,
+            status TEXT NOT NULL,
+            git_commit_hash TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS experiment_runs (
             run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artifact_id INTEGER,
             cluster_id INTEGER,
+            conjecture_id INTEGER,
             experiment_type TEXT NOT NULL,
+            input_path TEXT,
+            output_path TEXT,
             input_json TEXT NOT NULL,
             output_json TEXT NOT NULL,
             result_summary TEXT,
+            command_run TEXT,
+            git_commit_hash TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             notes TEXT,
-            FOREIGN KEY(cluster_id) REFERENCES research_clusters(cluster_id)
+            FOREIGN KEY(artifact_id) REFERENCES code_artifacts(artifact_id),
+            FOREIGN KEY(cluster_id) REFERENCES research_clusters(cluster_id),
+            FOREIGN KEY(conjecture_id) REFERENCES conjectures(conjecture_id)
         );
         """
     )
@@ -417,6 +441,20 @@ def _migrate_existing_tables(connection: sqlite3.Connection) -> None:
         },
     )
     _add_missing_columns(connection, "proof_attempts", {"cluster_id": "INTEGER"})
+    _add_missing_columns(
+        connection,
+        "experiment_runs",
+        {
+            "artifact_id": "INTEGER",
+            "conjecture_id": "INTEGER",
+            "input_path": "TEXT",
+            "output_path": "TEXT",
+            "command_run": "TEXT",
+            "git_commit_hash": "TEXT",
+            "input_json": "TEXT NOT NULL DEFAULT '{}'",
+            "output_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
 
 
 def _add_missing_columns(connection: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
@@ -1066,21 +1104,99 @@ def list_evidence_spans(connection: sqlite3.Connection, entry_type: str | None =
     return [_row_to_evidence_span(row) for row in connection.execute(query, params).fetchall()]
 
 
+def insert_code_artifact(connection: sqlite3.Connection, artifact: CodeArtifact) -> int:
+    """Insert code-artifact metadata and return its id."""
+
+    connection.execute(
+        """
+        INSERT INTO code_artifacts (
+            name, path, artifact_type, description, related_concepts,
+            related_conjectures, tests_path, status, git_commit_hash, notes
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            artifact.name,
+            artifact.path,
+            artifact.artifact_type,
+            artifact.description,
+            _json_dumps(artifact.related_concepts),
+            _json_dumps(artifact.related_conjectures),
+            artifact.tests_path,
+            artifact.status,
+            artifact.git_commit_hash,
+            artifact.notes,
+        ),
+    )
+    return _last_insert_id(connection)
+
+
+def list_code_artifacts(
+    connection: sqlite3.Connection,
+    artifact_type: str | None = None,
+    status: str | None = None,
+) -> list[CodeArtifact]:
+    """List registered code artifacts."""
+
+    query = "SELECT * FROM code_artifacts"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if artifact_type is not None:
+        clauses.append("artifact_type = ?")
+        params.append(artifact_type)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY artifact_id"
+    return [_row_to_code_artifact(row) for row in connection.execute(query, params).fetchall()]
+
+
+def get_code_artifact(connection: sqlite3.Connection, artifact_id: int) -> CodeArtifact | None:
+    """Fetch one code artifact by id."""
+
+    row = connection.execute(
+        "SELECT * FROM code_artifacts WHERE artifact_id = ?",
+        (artifact_id,),
+    ).fetchone()
+    return _row_to_code_artifact(row) if row else None
+
+
+def update_code_artifact_status(connection: sqlite3.Connection, artifact_id: int, status: str) -> None:
+    """Update a code artifact status."""
+
+    connection.execute(
+        "UPDATE code_artifacts SET status = ? WHERE artifact_id = ?",
+        (status, artifact_id),
+    )
+
+
 def insert_experiment_run(connection: sqlite3.Connection, run: ExperimentRun) -> int:
     """Insert a small experiment run and return its id."""
 
     connection.execute(
         """
         INSERT INTO experiment_runs
-            (cluster_id, experiment_type, input_json, output_json, result_summary, notes)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (
+                artifact_id, cluster_id, conjecture_id, experiment_type,
+                input_path, output_path, input_json, output_json,
+                result_summary, command_run, git_commit_hash, notes
+            )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            run.artifact_id,
             run.cluster_id,
+            run.conjecture_id,
             run.experiment_type,
+            run.input_path,
+            run.output_path,
             _json_dumps(run.input_json),
             _json_dumps(run.output_json),
             run.result_summary,
+            run.command_run,
+            run.git_commit_hash,
             run.notes,
         ),
     )
@@ -1098,6 +1214,13 @@ def list_experiment_runs(connection: sqlite3.Connection, cluster_id: int | None 
             (cluster_id,),
         ).fetchall()
     return [_row_to_experiment_run(row) for row in rows]
+
+
+def get_experiment_run(connection: sqlite3.Connection, run_id: int) -> ExperimentRun | None:
+    """Fetch one experiment run by id."""
+
+    row = connection.execute("SELECT * FROM experiment_runs WHERE run_id = ?", (run_id,)).fetchone()
+    return _row_to_experiment_run(row) if row else None
 
 
 def _row_to_concept(row: sqlite3.Row) -> Concept:
@@ -1258,13 +1381,35 @@ def _row_to_evidence_span(row: sqlite3.Row) -> EvidenceSpan:
     )
 
 
+def _row_to_code_artifact(row: sqlite3.Row) -> CodeArtifact:
+    return CodeArtifact(
+        artifact_id=row["artifact_id"],
+        name=row["name"],
+        path=row["path"],
+        artifact_type=row["artifact_type"],
+        description=row["description"],
+        related_concepts=_json_loads(row["related_concepts"], []),
+        related_conjectures=_json_loads(row["related_conjectures"], []),
+        tests_path=row["tests_path"],
+        status=row["status"],
+        git_commit_hash=row["git_commit_hash"],
+        notes=row["notes"],
+    )
+
+
 def _row_to_experiment_run(row: sqlite3.Row) -> ExperimentRun:
     return ExperimentRun(
         run_id=row["run_id"],
+        artifact_id=row["artifact_id"],
         cluster_id=row["cluster_id"],
+        conjecture_id=row["conjecture_id"],
         experiment_type=row["experiment_type"],
+        input_path=row["input_path"],
+        output_path=row["output_path"],
         input_json=_json_loads(row["input_json"], {}),
         output_json=_json_loads(row["output_json"], {}),
         result_summary=row["result_summary"],
+        command_run=row["command_run"],
+        git_commit_hash=row["git_commit_hash"],
         notes=row["notes"],
     )

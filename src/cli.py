@@ -8,7 +8,14 @@ import sys
 from pathlib import Path
 
 from . import db
+from .code_artifacts import (
+    get_code_artifact,
+    list_code_artifacts,
+    register_code_artifact,
+    update_code_artifact_status,
+)
 from .curate import approve_pending, curate_pending, flag_pending, reject_pending
+from .experiment_manager import run_experiment
 from .extract import LLMClient, extract_from_text
 from .experiments.ats_brute_solver import find_memoryless_safety_strategy
 from .experiments.ats_generator import generate_tiny_game
@@ -169,6 +176,47 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_parser = subparsers.add_parser("run-pipeline", help="Run one bounded manual pipeline step")
     pipeline_parser.add_argument("--cluster-id", required=True, type=int)
     pipeline_parser.add_argument("--mode", required=True, choices=["literature", "experiments"])
+
+    artifact_parser = subparsers.add_parser("register-code-artifact", help="Register reusable code metadata")
+    artifact_parser.add_argument("--name", required=True)
+    artifact_parser.add_argument("--path", required=True)
+    artifact_parser.add_argument(
+        "--artifact-type",
+        required=True,
+        choices=["library", "solver", "generator", "reduction", "checker", "proof_check", "experiment_script"],
+    )
+    artifact_parser.add_argument("--description")
+    artifact_parser.add_argument("--related-concepts", default="", help="Semicolon-separated concept ids or names")
+    artifact_parser.add_argument("--related-conjectures", default="", help="Semicolon-separated conjecture ids")
+    artifact_parser.add_argument("--tests-path")
+    artifact_parser.add_argument("--status", default="draft", choices=["draft", "tested", "deprecated"])
+    artifact_parser.add_argument("--notes")
+
+    list_artifact_parser = subparsers.add_parser("list-code-artifacts", help="List registered code artifacts")
+    list_artifact_parser.add_argument("--artifact-type")
+    list_artifact_parser.add_argument("--status")
+
+    show_artifact_parser = subparsers.add_parser("show-code-artifact", help="Show one code artifact")
+    show_artifact_parser.add_argument("--artifact-id", required=True, type=int)
+
+    update_artifact_parser = subparsers.add_parser("update-code-artifact-status", help="Update artifact status")
+    update_artifact_parser.add_argument("--artifact-id", required=True, type=int)
+    update_artifact_parser.add_argument("--status", required=True, choices=["draft", "tested", "deprecated"])
+
+    run_experiment_parser = subparsers.add_parser("run-experiment", help="Run a command and store experiment metadata")
+    run_experiment_parser.add_argument("--artifact-id", required=True, type=int)
+    run_experiment_parser.add_argument("--command", required=True, dest="run_command")
+    run_experiment_parser.add_argument("--input-path")
+    run_experiment_parser.add_argument("--output-path")
+    run_experiment_parser.add_argument("--cluster-id", type=int)
+    run_experiment_parser.add_argument("--conjecture-id", type=int)
+    run_experiment_parser.add_argument("--experiment-type")
+    run_experiment_parser.add_argument("--notes")
+
+    subparsers.add_parser("list-experiment-runs", help="List experiment runs")
+
+    show_run_parser = subparsers.add_parser("show-experiment-run", help="Show one experiment run")
+    show_run_parser.add_argument("--run-id", required=True, type=int)
 
     return parser
 
@@ -434,6 +482,80 @@ def main(argv: list[str] | None = None) -> int:
         print(result.summary)
         return 0
 
+    if args.command == "register-code-artifact":
+        artifact_id = register_code_artifact(
+            name=args.name,
+            path=args.path,
+            artifact_type=args.artifact_type,
+            description=args.description,
+            related_concepts=_split_semicolon(args.related_concepts),
+            related_conjectures=_split_ints(args.related_conjectures),
+            tests_path=args.tests_path,
+            status=args.status,
+            notes=args.notes,
+            db_path=args.db,
+        )
+        print(f"Registered code artifact {artifact_id}")
+        return 0
+
+    if args.command == "list-code-artifacts":
+        artifacts = list_code_artifacts(
+            artifact_type=args.artifact_type,
+            status=args.status,
+            db_path=args.db,
+        )
+        for artifact in artifacts:
+            print(f"{artifact.artifact_id}: [{artifact.status}] {artifact.artifact_type} {artifact.name} -> {artifact.path}")
+        return 0
+
+    if args.command == "show-code-artifact":
+        artifact = get_code_artifact(args.artifact_id, db_path=args.db)
+        if artifact is None:
+            raise SystemExit(f"code artifact {args.artifact_id} does not exist")
+        print(json.dumps(artifact.model_dump(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "update-code-artifact-status":
+        update_code_artifact_status(args.artifact_id, args.status, db_path=args.db)
+        print(f"Updated code artifact {args.artifact_id} to {args.status}")
+        return 0
+
+    if args.command == "run-experiment":
+        execution = run_experiment(
+            artifact_id=args.artifact_id,
+            command=args.run_command,
+            input_path=args.input_path,
+            output_path=args.output_path,
+            cluster_id=args.cluster_id,
+            conjecture_id=args.conjecture_id,
+            experiment_type=args.experiment_type,
+            notes=args.notes,
+            db_path=args.db,
+        )
+        print(
+            f"Recorded experiment run {execution.run_id}: "
+            f"{execution.result_summary} output={execution.result_file}"
+        )
+        return 0
+
+    if args.command == "list-experiment-runs":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            runs = db.list_experiment_runs(connection)
+        for run in runs:
+            artifact = f" artifact={run.artifact_id}" if run.artifact_id else ""
+            print(f"{run.run_id}: {run.experiment_type} {run.result_summary or ''}{artifact}")
+        return 0
+
+    if args.command == "show-experiment-run":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            run = db.get_experiment_run(connection, args.run_id)
+        if run is None:
+            raise SystemExit(f"experiment run {args.run_id} does not exist")
+        print(json.dumps(run.model_dump(), indent=2, sort_keys=True))
+        return 0
+
     parser.error(f"unknown command {args.command}")
     return 2
 
@@ -497,6 +619,12 @@ def _split_semicolon(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(";") if item.strip()]
+
+
+def _split_ints(value: str | None) -> list[int]:
+    if not value:
+        return []
+    return [int(item.strip()) for item in value.split(";") if item.strip()]
 
 
 def _read_text_arg(text: str | None, file_path: str | None) -> str:

@@ -52,6 +52,16 @@ TheoremType = Literal[
 Confidence = Literal["pending", "verified", "rejected", "needs_review"]
 ReviewStatus = Literal["draft", "active", "closed", "refuted", "proved", "paused", "abandoned"]
 ConjectureExpectedStatus = Literal["true", "false", "unknown"]
+ArtifactType = Literal[
+    "library",
+    "solver",
+    "generator",
+    "reduction",
+    "checker",
+    "proof_check",
+    "experiment_script",
+]
+ArtifactStatus = Literal["draft", "tested", "deprecated"]
 ModelType = Literal[
     "ATS",
     "CDM",
@@ -313,15 +323,37 @@ class EvidenceSpan(StrictBase):
     notes: str | None = None
 
 
+class CodeArtifact(StrictBase):
+    """Metadata for reusable research code stored in Git and the filesystem."""
+
+    artifact_id: int | None = None
+    name: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    artifact_type: ArtifactType
+    description: str | None = None
+    related_concepts: list[int | str] = Field(default_factory=list)
+    related_conjectures: list[int] = Field(default_factory=list)
+    tests_path: str | None = None
+    status: ArtifactStatus = "draft"
+    git_commit_hash: str | None = None
+    notes: str | None = None
+
+
 class ExperimentRun(StrictBase):
     """A stored run from a small checker, generator, or solver experiment."""
 
     run_id: int | None = None
+    artifact_id: int | None = None
     cluster_id: int | None = None
+    conjecture_id: int | None = None
     experiment_type: str = Field(min_length=1)
+    input_path: str | None = None
+    output_path: str | None = None
     input_json: dict[str, Any] = Field(default_factory=dict)
     output_json: dict[str, Any] = Field(default_factory=dict)
     result_summary: str | None = None
+    command_run: str | None = None
+    git_commit_hash: str | None = None
     notes: str | None = None
 
 

@@ -150,6 +150,49 @@ Run the bounded brute checker:
 python -m src.cli brute-check --input data/tiny_game.json --depth 5
 ```
 
+## Code And Experiment Management
+
+Research claims live in the database. Code lives in Git. Experiment metadata links them.
+
+Reusable implementation code should live under `src/libraries/`, `src/experiments/`, or ordinary Git-tracked experiment scripts. SQLite stores artifact metadata, command lines, result summaries, input/output paths, and git commit hashes. It does not store source-code blobs.
+
+The repository includes these long-term code and output areas:
+
+```text
+src/libraries/
+  ats/
+  graph_games/
+  reductions/
+  search/
+experiments/
+  restricted_2dm/
+  reachability_gap/
+  logical_characterization/
+generated/
+  games/
+  counterexamples/
+results/
+```
+
+Register the current ATS brute checker as a code artifact:
+
+```powershell
+python -m src.cli register-code-artifact --name "ATS brute checker" --path "src/experiments/ats_brute_solver.py" --artifact-type checker --tests-path "tests/test_brute_solver.py" --related-concepts "ATS games;safety objective"
+python -m src.cli list-code-artifacts
+python -m src.cli show-code-artifact --artifact-id 1
+```
+
+Generate a tiny input game and run the checker as a recorded experiment:
+
+```powershell
+python -m src.cli generate-game --kind ATS --processes 2 --states 2 --seed 1 --output generated/games/tiny_ats.json
+python -m src.cli run-experiment --artifact-id 1 --command "python -m src.cli brute-check --input generated/games/tiny_ats.json --depth 5" --input-path generated/games/tiny_ats.json --experiment-type ats_bounded_safety --conjecture-id 1
+python -m src.cli list-experiment-runs
+python -m src.cli show-experiment-run --run-id 1
+```
+
+Stdout and stderr are written to a timestamped file under `results/`. Previous result files are never deleted by the runner.
+
 Run one bounded pipeline step:
 
 ```powershell
@@ -162,4 +205,3 @@ python -m src.cli run-pipeline --cluster-id 1 --mode experiments
 ```powershell
 python -m pytest
 ```
-
