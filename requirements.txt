@@ -1,0 +1,4 @@
+pydantic>=2.6,<3
+pytest>=8,<9
+python-dotenv>=1,<2
+
