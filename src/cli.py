@@ -1,4 +1,4 @@
-"""Argparse command-line interface for the research harness."""
+"""CLI for decidability, complexity, and synthesis research workflows."""
 
 from __future__ import annotations
 
@@ -8,20 +8,27 @@ import sys
 from pathlib import Path
 
 from . import db
-from .brute_solver import find_memoryless_safety_strategy
-from .curate import approve_pending, reject_pending
+from .curate import approve_pending, curate_pending, flag_pending, reject_pending
 from .extract import LLMClient, extract_from_text
-from .generate_examples import generate_tiny_game
+from .experiments.ats_brute_solver import find_memoryless_safety_strategy
+from .experiments.ats_generator import generate_tiny_game
+from .experiments.ats_models import SafetyGame
 from .ingest import add_paper
-from .models import SafetyGame
+from .orchestrator import run_pipeline
+from .schemas import Concept, ConceptLink, Conjecture, ResearchCluster
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local research harness CLI")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Research harness for decidability, complexity, and strategy synthesis "
+            "in distributed games and automata-theoretic synthesis."
+        )
+    )
     parser.add_argument("--db", default=str(db.DEFAULT_DB_PATH), help="SQLite database path")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("init-db", help="Create database tables")
+    subparsers.add_parser("init-db", help="Create or migrate database tables")
 
     add_paper_parser = subparsers.add_parser("add-paper", help="Add a paper manually")
     add_paper_parser.add_argument("--title", required=True)
@@ -30,22 +37,124 @@ def build_parser() -> argparse.ArgumentParser:
     add_paper_parser.add_argument("--venue")
     add_paper_parser.add_argument("--pdf-path")
     add_paper_parser.add_argument("--notes")
+    add_paper_parser.add_argument("--cluster-id", type=int)
 
-    subparsers.add_parser("list-papers", help="List papers")
+    list_papers_parser = subparsers.add_parser("list-papers", help="List papers")
+    list_papers_parser.add_argument("--cluster-id", type=int)
 
     extract_parser = subparsers.add_parser("extract-from-text", help="Extract entries into pending queue")
     extract_parser.add_argument("--text", help="Text to extract from")
     extract_parser.add_argument("--file", help="Text file to extract from")
 
     pending_parser = subparsers.add_parser("list-pending", help="List pending entries")
-    pending_parser.add_argument("--status", default="pending", help="pending, approved, rejected, or all")
+    pending_parser.add_argument("--status", default="pending", help="pending, flagged, approved, rejected, or all")
 
-    approve_parser = subparsers.add_parser("approve-pending", help="Approve or reject a pending entry")
+    subparsers.add_parser("curate-pending", help="Analyze pending entries and print warnings")
+
+    detail_parser = subparsers.add_parser("show-pending-detail", help="Show one pending entry as JSON")
+    detail_parser.add_argument("entry_id", type=int)
+
+    approve_parser = subparsers.add_parser("approve-pending", help="Approve a pending entry")
     approve_parser.add_argument("entry_id", type=int)
-    approve_parser.add_argument("--reject", action="store_true", help="Reject instead of approving")
-    approve_parser.add_argument("--reason", help="Rejection reason")
+    approve_parser.add_argument("--reject", action="store_true", help="Compatibility: reject instead of approving")
+    approve_parser.add_argument("--reason", help="Compatibility rejection reason")
 
-    generate_parser = subparsers.add_parser("generate-game", help="Generate a tiny safety game")
+    reject_parser = subparsers.add_parser("reject-pending", help="Reject a pending entry")
+    reject_parser.add_argument("entry_id", type=int)
+    reject_parser.add_argument("--reason")
+
+    flag_parser = subparsers.add_parser("flag-pending", help="Flag a pending entry for later review")
+    flag_parser.add_argument("entry_id", type=int)
+    flag_parser.add_argument("--reason", required=True)
+
+    cluster_parser = subparsers.add_parser("add-cluster", help="Add a research cluster")
+    cluster_parser.add_argument("--name", required=True)
+    cluster_parser.add_argument("--description")
+    cluster_parser.add_argument("--status", default="active", choices=["active", "watchlist", "archived"])
+    cluster_parser.add_argument("--priority", default=0, type=int)
+    cluster_parser.add_argument("--notes")
+
+    list_clusters_parser = subparsers.add_parser("list-clusters", help="List research clusters")
+    list_clusters_parser.add_argument("--status")
+
+    concept_parser = subparsers.add_parser("add-concept", help="Add an ontology concept")
+    concept_parser.add_argument("--name", required=True)
+    concept_parser.add_argument(
+        "--type",
+        required=True,
+        choices=[
+            "model",
+            "objective",
+            "strategy",
+            "architecture",
+            "complexity_class",
+            "logic",
+            "proof_technique",
+            "reduction_type",
+        ],
+    )
+    concept_parser.add_argument("--description")
+    concept_parser.add_argument("--aliases", default="", help="Semicolon-separated aliases")
+    concept_parser.add_argument("--notes")
+
+    list_concepts_parser = subparsers.add_parser("list-concepts", help="List ontology concepts")
+    list_concepts_parser.add_argument("--type")
+
+    link_parser = subparsers.add_parser("link-concepts", help="Add a typed relation between concepts")
+    link_parser.add_argument("--source", required=True, type=int)
+    link_parser.add_argument("--target", required=True, type=int)
+    link_parser.add_argument(
+        "--relation",
+        required=True,
+        choices=[
+            "generalizes",
+            "specializes",
+            "equivalent_to",
+            "reduces_to",
+            "uses",
+            "conflicts_with",
+            "related_to",
+        ],
+    )
+    link_parser.add_argument("--notes")
+
+    by_cluster_parser = subparsers.add_parser("theorems-by-cluster", help="List theorems for a cluster")
+    by_cluster_parser.add_argument("cluster_id", type=int)
+
+    by_model_parser = subparsers.add_parser("theorems-by-model", help="List theorems by model family")
+    by_model_parser.add_argument("model_family")
+
+    by_objective_parser = subparsers.add_parser("theorems-by-objective", help="List theorems by objective family")
+    by_objective_parser.add_argument("objective_family")
+
+    op_cluster_parser = subparsers.add_parser("open-problems-by-cluster", help="List open problems for a cluster")
+    op_cluster_parser.add_argument("cluster_id", type=int)
+
+    subparsers.add_parser("show-research-map", help="Print compact research map summary")
+
+    conjecture_parser = subparsers.add_parser("add-conjecture", help="Add a conjecture")
+    conjecture_parser.add_argument("--statement", required=True)
+    conjecture_parser.add_argument("--title")
+    conjecture_parser.add_argument("--cluster-id", type=int)
+    conjecture_parser.add_argument("--motivation")
+    conjecture_parser.add_argument("--expected-status", default="unknown", choices=["true", "false", "unknown"])
+    conjecture_parser.add_argument("--confidence", default="needs_review", choices=["pending", "verified", "rejected", "needs_review"])
+    conjecture_parser.add_argument("--attack-plan")
+    conjecture_parser.add_argument("--possible-counterexamples", default="", help="Semicolon-separated notes")
+    conjecture_parser.add_argument("--status", default="active", choices=["active", "paused", "refuted", "proved", "abandoned"])
+    conjecture_parser.add_argument("--notes")
+
+    list_conjectures_parser = subparsers.add_parser("list-conjectures", help="List conjectures")
+    list_conjectures_parser.add_argument("--cluster-id", type=int)
+
+    show_conjecture_parser = subparsers.add_parser("show-conjecture", help="Show a conjecture")
+    show_conjecture_parser.add_argument("conjecture_id", type=int)
+
+    update_conjecture_parser = subparsers.add_parser("update-conjecture-status", help="Update conjecture status")
+    update_conjecture_parser.add_argument("conjecture_id", type=int)
+    update_conjecture_parser.add_argument("--status", required=True, choices=["active", "paused", "refuted", "proved", "abandoned"])
+
+    generate_parser = subparsers.add_parser("generate-game", help="Generate a tiny ATS/CDM/2DM safety game")
     generate_parser.add_argument("--kind", default="ATS", choices=["ATS", "CDM", "2DM"])
     generate_parser.add_argument("--processes", type=int, default=2)
     generate_parser.add_argument("--states", type=int, default=2)
@@ -53,9 +162,13 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--seed", type=int)
     generate_parser.add_argument("--output", help="Write generated JSON to this path")
 
-    brute_parser = subparsers.add_parser("brute-check", help="Run bounded brute-force safety check")
+    brute_parser = subparsers.add_parser("brute-check", help="Run bounded memoryless distributed safety check")
     brute_parser.add_argument("--input", help="Game JSON file; if omitted, a simple ATS game is generated")
     brute_parser.add_argument("--depth", type=int, default=5)
+
+    pipeline_parser = subparsers.add_parser("run-pipeline", help="Run one bounded manual pipeline step")
+    pipeline_parser.add_argument("--cluster-id", required=True, type=int)
+    pipeline_parser.add_argument("--mode", required=True, choices=["literature", "experiments"])
 
     return parser
 
@@ -71,14 +184,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "add-paper":
-        authors = [author.strip() for author in args.authors.split(";") if author.strip()]
         paper_id = add_paper(
             title=args.title,
-            authors=authors,
+            authors=_split_semicolon(args.authors),
             year=args.year,
             venue=args.venue,
             pdf_path=args.pdf_path,
             notes=args.notes,
+            cluster_id=args.cluster_id,
             db_path=args.db,
         )
         print(f"Added paper {paper_id}")
@@ -87,11 +200,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list-papers":
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
-            papers = db.list_papers(connection)
+            papers = db.list_papers(connection, cluster_id=args.cluster_id)
         for paper in papers:
             authors = ", ".join(paper.authors)
+            cluster = f" cluster={paper.cluster_id}" if paper.cluster_id else ""
             venue = f", {paper.venue}" if paper.venue else ""
-            print(f"{paper.id}: {paper.title} ({paper.year}{venue}) - {authors}")
+            print(f"{paper.id}: {paper.title} ({paper.year}{venue}) - {authors}{cluster}")
         return 0
 
     if args.command == "extract-from-text":
@@ -108,23 +222,184 @@ def main(argv: list[str] | None = None) -> int:
             db.create_tables(connection)
             entries = db.list_pending_entries(connection, status=status)
         for entry in entries:
-            title = entry.payload.get("title") or entry.payload.get("name") or "(untitled)"
+            title = entry.payload.get("title") or entry.payload.get("name") or entry.payload.get("summary") or "(untitled)"
             warning_text = f" warnings={entry.warnings}" if entry.warnings else ""
-            print(f"{entry.id}: {entry.entry_type} [{entry.status}] {title}{warning_text}")
+            print(f"{entry.id}: {entry.entry_type} [{entry.status}] {str(title)[:100]}{warning_text}")
+        return 0
+
+    if args.command == "curate-pending":
+        for analysis in curate_pending(db_path=args.db):
+            title = analysis.entry.payload.get("title") or analysis.entry.payload.get("name") or "(untitled)"
+            print(f"{analysis.entry.id}: {analysis.entry.entry_type} {title}")
+            if analysis.warnings:
+                print("  warnings: " + "; ".join(analysis.warnings))
+            if analysis.duplicates:
+                dupes = ", ".join(f"{d.table}:{d.entry_id}@{d.score:.2f}" for d in analysis.duplicates)
+                print("  duplicates: " + dupes)
+        return 0
+
+    if args.command == "show-pending-detail":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            entry = db.get_pending_entry(connection, args.entry_id)
+        if entry is None:
+            raise SystemExit(f"pending entry {args.entry_id} does not exist")
+        print(json.dumps(entry.model_dump(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "approve-pending":
         if args.reject:
             reject_pending(args.entry_id, reason=args.reason, db_path=args.db)
             print(f"Rejected pending entry {args.entry_id}")
-        else:
-            result = approve_pending(args.entry_id, db_path=args.db)
-            print(
-                f"Approved pending entry {result.pending_id} into "
-                f"{result.inserted_table}:{result.inserted_id}"
+            return 0
+        result = approve_pending(args.entry_id, db_path=args.db)
+        print(f"Approved pending entry {result.pending_id} into {result.inserted_table}:{result.inserted_id}")
+        if result.warnings:
+            print("Warnings: " + "; ".join(result.warnings))
+        return 0
+
+    if args.command == "reject-pending":
+        reject_pending(args.entry_id, reason=args.reason, db_path=args.db)
+        print(f"Rejected pending entry {args.entry_id}")
+        return 0
+
+    if args.command == "flag-pending":
+        flag_pending(args.entry_id, reason=args.reason, db_path=args.db)
+        print(f"Flagged pending entry {args.entry_id}")
+        return 0
+
+    if args.command == "add-cluster":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            cluster_id = db.insert_cluster(
+                connection,
+                ResearchCluster(
+                    name=args.name,
+                    description=args.description,
+                    status=args.status,
+                    priority=args.priority,
+                    notes=args.notes,
+                ),
             )
-            if result.warnings:
-                print("Warnings: " + "; ".join(result.warnings))
+        print(f"Added cluster {cluster_id}")
+        return 0
+
+    if args.command == "list-clusters":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            clusters = db.list_clusters(connection, status=args.status)
+        for cluster in clusters:
+            print(f"{cluster.cluster_id}: [{cluster.status}] p={cluster.priority} {cluster.name}")
+        return 0
+
+    if args.command == "add-concept":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            concept_id = db.insert_concept(
+                connection,
+                Concept(
+                    name=args.name,
+                    concept_type=args.type,
+                    description=args.description,
+                    aliases=_split_semicolon(args.aliases),
+                    notes=args.notes,
+                ),
+            )
+        print(f"Added concept {concept_id}")
+        return 0
+
+    if args.command == "list-concepts":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            concepts = db.list_concepts(connection, concept_type=args.type)
+        for concept in concepts:
+            aliases = f" aliases={concept.aliases}" if concept.aliases else ""
+            print(f"{concept.concept_id}: [{concept.concept_type}] {concept.name}{aliases}")
+        return 0
+
+    if args.command == "link-concepts":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            db.insert_concept_link(
+                connection,
+                ConceptLink(
+                    source_concept_id=args.source,
+                    target_concept_id=args.target,
+                    relation_type=args.relation,
+                    notes=args.notes,
+                ),
+            )
+        print(f"Linked concept {args.source} {args.relation} {args.target}")
+        return 0
+
+    if args.command == "theorems-by-cluster":
+        _print_theorems(args.db, cluster_id=args.cluster_id)
+        return 0
+
+    if args.command == "theorems-by-model":
+        _print_theorems(args.db, model_family=args.model_family)
+        return 0
+
+    if args.command == "theorems-by-objective":
+        _print_theorems(args.db, objective_family=args.objective_family)
+        return 0
+
+    if args.command == "open-problems-by-cluster":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            problems = db.list_open_problems(connection, cluster_id=args.cluster_id)
+        for problem in problems:
+            print(f"{problem.id}: {problem.title} [{problem.status}]")
+        return 0
+
+    if args.command == "show-research-map":
+        _print_research_map(args.db)
+        return 0
+
+    if args.command == "add-conjecture":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            conjecture_id = db.insert_conjecture(
+                connection,
+                Conjecture(
+                    title=args.title,
+                    statement=args.statement,
+                    cluster_id=args.cluster_id,
+                    motivation=args.motivation,
+                    expected_status=args.expected_status,
+                    confidence=args.confidence,
+                    attack_plan=args.attack_plan,
+                    possible_counterexamples=_split_semicolon(args.possible_counterexamples),
+                    status=args.status,
+                    notes=args.notes,
+                ),
+            )
+        print(f"Added conjecture {conjecture_id}")
+        return 0
+
+    if args.command == "list-conjectures":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            conjectures = db.list_conjectures(connection, cluster_id=args.cluster_id)
+        for conjecture in conjectures:
+            cluster = f" cluster={conjecture.cluster_id}" if conjecture.cluster_id else ""
+            print(f"{conjecture.id}: [{conjecture.status}] {conjecture.title}{cluster}")
+        return 0
+
+    if args.command == "show-conjecture":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            conjecture = db.get_conjecture(connection, args.conjecture_id)
+        if conjecture is None:
+            raise SystemExit(f"conjecture {args.conjecture_id} does not exist")
+        print(json.dumps(conjecture.model_dump(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "update-conjecture-status":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            db.update_conjecture_status(connection, args.conjecture_id, args.status)
+        print(f"Updated conjecture {args.conjecture_id} to {args.status}")
         return 0
 
     if args.command == "generate-game":
@@ -154,8 +429,74 @@ def main(argv: list[str] | None = None) -> int:
             print("counterexample=" + json.dumps(result.counterexample))
         return 0
 
+    if args.command == "run-pipeline":
+        result = run_pipeline(cluster_id=args.cluster_id, mode=args.mode, db_path=args.db)
+        print(result.summary)
+        return 0
+
     parser.error(f"unknown command {args.command}")
     return 2
+
+
+def _print_theorems(
+    db_path: str,
+    cluster_id: int | None = None,
+    model_family: str | None = None,
+    objective_family: str | None = None,
+) -> None:
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        theorems = db.list_theorems(
+            connection,
+            cluster_id=cluster_id,
+            model_family=model_family,
+            objective_family=objective_family,
+        )
+    for theorem in theorems:
+        bounds = " ".join(
+            part
+            for part in (
+                f"upper={theorem.complexity_upper}" if theorem.complexity_upper else "",
+                f"lower={theorem.complexity_lower}" if theorem.complexity_lower else "",
+            )
+            if part
+        )
+        print(f"{theorem.id}: [{theorem.theorem_type}] {theorem.title} {bounds}".rstrip())
+
+
+def _print_research_map(db_path: str) -> None:
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        clusters = db.list_clusters(connection, status="active")
+        papers = db.list_papers(connection)
+        theorems = db.list_theorems(connection)
+        problems = db.list_open_problems(connection)
+        conjectures = db.list_conjectures(connection)
+    print("Active clusters")
+    for cluster in clusters[:10]:
+        print(f"- {cluster.cluster_id}: {cluster.name}")
+    print("Key papers")
+    for paper in papers[:10]:
+        print(f"- {paper.id}: {paper.title} ({paper.year})")
+    print("Key theorems")
+    for theorem in theorems[:10]:
+        print(f"- {theorem.id}: {theorem.title} [{theorem.theorem_type}]")
+    print("Known upper/lower bounds")
+    for theorem in theorems:
+        if theorem.complexity_upper or theorem.complexity_lower:
+            print(f"- {theorem.title}: upper={theorem.complexity_upper} lower={theorem.complexity_lower}")
+    print("Open gaps")
+    for problem in problems[:10]:
+        print(f"- {problem.id}: {problem.title}")
+    print("Candidate conjectures")
+    for conjecture in conjectures[:10]:
+        print(f"- {conjecture.id}: {conjecture.title} [{conjecture.status}]")
+
+
+def _split_semicolon(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(";") if item.strip()]
 
 
 def _read_text_arg(text: str | None, file_path: str | None) -> str:

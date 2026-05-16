@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.pytest_tmp/
 data/*.db
 data/*.db-journal
 data/*.json
