@@ -1,0 +1,29 @@
+{
+  "statement": "ATS games are undecidable; equivalence with asynchronous games transfers known undecidability.",
+  "theorem_type": "undecidability",
+  "model_family": "ATS_game",
+  "objective_family": "regular_trace_winning; safety transfer remark",
+  "architecture_assumptions": [
+    "non-deterministic asynchronous transition systems over multiple processes"
+  ],
+  "information_assumptions": [
+    "causal_past",
+    "causal_memory",
+    "environment_as_scheduler"
+  ],
+  "strategy_assumptions": [
+    "distributed strategy"
+  ],
+  "process_bound": "fixed finite number of processes; six-process safety transfer remark",
+  "complexity_upper": null,
+  "complexity_lower": "undecidable",
+  "memory_upper": null,
+  "memory_lower": null,
+  "proof_technique": "equivalence/translation to asynchronous games",
+  "source_paper_id": 2,
+  "source_location": "Abstract and pages 6-8 discussion",
+  "confidence": "verified",
+  "cluster_id": 1,
+  "notes": "Seed approval artifact; verify exact formulation before approval."
+}
+

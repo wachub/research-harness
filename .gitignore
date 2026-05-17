@@ -9,6 +9,15 @@ data/*.json
 generated/games/*
 generated/counterexamples/*
 results/*
+!results/extract/
+!results/curation/
+!results/approved/
+results/extract/*
+results/curation/*
+!results/extract/.gitkeep
+!results/curation/.gitkeep
+!results/approved/.gitkeep
+!results/approved/*.json
 !generated/games/.gitkeep
 !generated/counterexamples/.gitkeep
 !results/.gitkeep

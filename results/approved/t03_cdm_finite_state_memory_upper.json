@@ -1,0 +1,28 @@
+{
+  "statement": "The distributed strategy extracted from a positional sequential strategy is finite-state; for safety/parity CDM games this yields a gossip-based memory automaton with distributed memory bounded by (max_i |S_i|)^{|P|} * max_i |V_i|.",
+  "theorem_type": "construction",
+  "model_family": "CDM_game",
+  "objective_family": "global_safety; local_parity",
+  "architecture_assumptions": [
+    "single central decision maker participates in every nondeterministic action"
+  ],
+  "information_assumptions": [
+    "causal_memory",
+    "gossip automaton tracks latest information"
+  ],
+  "strategy_assumptions": [
+    "finite-state distributed strategy"
+  ],
+  "process_bound": "finite but unbounded number of processes",
+  "complexity_upper": "constructive upper bound",
+  "complexity_lower": null,
+  "memory_upper": "(max_i |S_i|)^{|P|} * max_i |V_i|",
+  "memory_lower": null,
+  "proof_technique": "strategy extraction plus gossip-automaton construction",
+  "source_paper_id": 1,
+  "source_location": "Theorem 36 and following discussion, pages 5:15-5:16",
+  "confidence": "verified",
+  "cluster_id": 1,
+  "notes": "Seed approval artifact; verify formula notation before approval."
+}
+

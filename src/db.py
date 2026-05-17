@@ -33,21 +33,21 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "research.db"
 SEED_CLUSTERS: tuple[ResearchCluster, ...] = (
     ResearchCluster(
         name="Restricted multi-decision-maker synthesis",
-        description="Seed cluster for restricted distributed synthesis, including ATS/CDM/2DM results.",
+        description="ATS/CDM/2DM frontier: decidability, complexity, and memory under causal memory; focus on central-decision-maker restrictions and small decidable extensions.",
         status="active",
-        priority=10,
+        priority=1,
     ),
     ResearchCluster(
-        name="Two-process distributed reachability",
-        description="Decidability and complexity around two-process architectures and reachability objectives.",
+        name="Global objectives in causal-memory games",
+        description="Petri/control/ATS results for global safety, good-and-bad markings, parity, and reductions that separate decidable safety from undecidable liveness.",
         status="active",
-        priority=8,
+        priority=2,
     ),
     ResearchCluster(
-        name="Logical/automata characterizations of distributed strategies",
-        description="MSO, automata-theoretic, and strategy-language characterizations.",
+        name="Acyclic architectures and automata-theoretic transfers",
+        description="Zielonka automata, acyclic/tree architectures, decomposable games, and transfers between control-game and Petri-game formulations.",
         status="active",
-        priority=8,
+        priority=3,
     ),
     ResearchCluster(
         name="Petri games and control games",
@@ -66,6 +66,18 @@ SEED_CLUSTERS: tuple[ResearchCluster, ...] = (
         description="Partial-information games, observation structures, and knowledge-based synthesis.",
         status="active",
         priority=7,
+    ),
+    ResearchCluster(
+        name="Two-process distributed reachability",
+        description="Decidability and complexity around two-process architectures and reachability objectives.",
+        status="watchlist",
+        priority=5,
+    ),
+    ResearchCluster(
+        name="Logical/automata characterizations of distributed strategies",
+        description="MSO, automata-theoretic, and strategy-language characterizations.",
+        status="watchlist",
+        priority=5,
     ),
 )
 
@@ -165,6 +177,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
             year INTEGER NOT NULL,
             venue TEXT,
             pdf_path TEXT,
+            url TEXT,
             notes TEXT,
             cluster_id INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -324,14 +337,18 @@ def create_tables(connection: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             path TEXT NOT NULL,
             artifact_type TEXT NOT NULL,
+            entrypoint TEXT,
+            language TEXT,
             description TEXT,
+            cluster_id INTEGER,
             related_concepts TEXT NOT NULL,
             related_conjectures TEXT NOT NULL,
             tests_path TEXT,
             status TEXT NOT NULL,
             git_commit_hash TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            notes TEXT
+            notes TEXT,
+            FOREIGN KEY(cluster_id) REFERENCES research_clusters(cluster_id)
         );
 
         CREATE TABLE IF NOT EXISTS experiment_runs (
@@ -363,7 +380,7 @@ def _migrate_existing_tables(connection: sqlite3.Connection) -> None:
     _add_missing_columns(
         connection,
         "papers",
-        {"cluster_id": "INTEGER"},
+        {"cluster_id": "INTEGER", "url": "TEXT"},
     )
     _add_missing_columns(
         connection,
@@ -455,13 +472,26 @@ def _migrate_existing_tables(connection: sqlite3.Connection) -> None:
             "output_json": "TEXT NOT NULL DEFAULT '{}'",
         },
     )
+    _add_missing_columns(
+        connection,
+        "code_artifacts",
+        {
+            "entrypoint": "TEXT",
+            "language": "TEXT",
+            "cluster_id": "INTEGER",
+        },
+    )
 
 
 def _add_missing_columns(connection: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
     existing = set(_column_names(connection, table))
     for name, definition in columns.items():
         if name not in existing:
-            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            try:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
 
 def _column_names(connection: sqlite3.Connection, table: str) -> list[str]:
@@ -506,13 +536,26 @@ def insert_cluster(
     """Insert a research cluster and return its id."""
 
     verb = "INSERT OR IGNORE" if ignore_existing else "INSERT"
-    connection.execute(
-        f"""
-        {verb} INTO research_clusters (name, description, status, priority, notes)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (cluster.name, cluster.description, cluster.status, cluster.priority, cluster.notes),
-    )
+    try:
+        connection.execute(
+            f"""
+            {verb} INTO research_clusters (name, description, status, priority, notes)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (cluster.name, cluster.description, cluster.status, cluster.priority, cluster.notes),
+        )
+    except sqlite3.IntegrityError:
+        connection.execute(
+            """
+            UPDATE research_clusters
+            SET description = COALESCE(?, description),
+                status = ?,
+                priority = ?,
+                notes = COALESCE(?, notes)
+            WHERE name = ?
+            """,
+            (cluster.description, cluster.status, cluster.priority, cluster.notes, cluster.name),
+        )
     row = connection.execute(
         "SELECT cluster_id FROM research_clusters WHERE name = ?",
         (cluster.name,),
@@ -648,10 +691,17 @@ def list_concept_links(connection: sqlite3.Connection) -> list[ConceptLink]:
 def insert_paper(connection: sqlite3.Connection, paper: Paper) -> int:
     """Insert a paper and return its id."""
 
+    existing = connection.execute(
+        "SELECT id FROM papers WHERE title = ? AND year = ? ORDER BY id LIMIT 1",
+        (paper.title, paper.year),
+    ).fetchone()
+    if existing:
+        return int(existing["id"])
+
     connection.execute(
         """
-        INSERT INTO papers (title, authors_json, year, venue, pdf_path, notes, cluster_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO papers (title, authors_json, year, venue, pdf_path, url, notes, cluster_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             paper.title,
@@ -659,6 +709,7 @@ def insert_paper(connection: sqlite3.Connection, paper: Paper) -> int:
             paper.year,
             paper.venue,
             paper.pdf_path,
+            paper.url,
             paper.notes,
             paper.cluster_id,
         ),
@@ -933,6 +984,29 @@ def update_pending_status(
     )
 
 
+def update_pending_payload(
+    connection: sqlite3.Connection,
+    entry_id: int,
+    payload: dict[str, Any],
+    warnings: Iterable[str] | None = None,
+) -> None:
+    """Replace the payload for a pending entry, optionally replacing warnings."""
+
+    connection.execute(
+        """
+        UPDATE pending_entries
+        SET payload_json = ?,
+            warnings_json = COALESCE(?, warnings_json)
+        WHERE id = ?
+        """,
+        (
+            _json_dumps(payload),
+            _json_dumps(list(warnings)) if warnings is not None else None,
+            entry_id,
+        ),
+    )
+
+
 def insert_derived_result(connection: sqlite3.Connection, result: DerivedResult) -> int:
     """Insert a derived result and return its id."""
 
@@ -1110,16 +1184,19 @@ def insert_code_artifact(connection: sqlite3.Connection, artifact: CodeArtifact)
     connection.execute(
         """
         INSERT INTO code_artifacts (
-            name, path, artifact_type, description, related_concepts,
+            name, path, artifact_type, entrypoint, language, description, cluster_id, related_concepts,
             related_conjectures, tests_path, status, git_commit_hash, notes
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             artifact.name,
             artifact.path,
             artifact.artifact_type,
+            artifact.entrypoint,
+            artifact.language,
             artifact.description,
+            artifact.cluster_id,
             _json_dumps(artifact.related_concepts),
             _json_dumps(artifact.related_conjectures),
             artifact.tests_path,
@@ -1242,6 +1319,7 @@ def _row_to_paper(row: sqlite3.Row) -> Paper:
         year=row["year"],
         venue=row["venue"],
         pdf_path=row["pdf_path"],
+        url=row["url"],
         notes=row["notes"],
         cluster_id=row["cluster_id"],
     )
@@ -1387,7 +1465,10 @@ def _row_to_code_artifact(row: sqlite3.Row) -> CodeArtifact:
         name=row["name"],
         path=row["path"],
         artifact_type=row["artifact_type"],
+        entrypoint=row["entrypoint"],
+        language=row["language"],
         description=row["description"],
+        cluster_id=row["cluster_id"],
         related_concepts=_json_loads(row["related_concepts"], []),
         related_conjectures=_json_loads(row["related_conjectures"], []),
         tests_path=row["tests_path"],

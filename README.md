@@ -193,6 +193,26 @@ python -m src.cli show-experiment-run --run-id 1
 
 Stdout and stderr are written to a timestamped file under `results/`. Previous result files are never deleted by the runner.
 
+## Week-One Seed Assets
+
+The repository includes seed prompt files under `prompts/` and approval JSON templates under `results/approved/` for an initial LICS-style literature spine:
+
+- restricted ATS/CDM/2DM synthesis
+- global objectives in causal-memory games
+- acyclic architectures and automata-theoretic transfers
+
+The ordered-2DM conjecture loop has a small driver at:
+
+```text
+experiments/restricted_2dm/run_tiny_ordered_2dm_search.py
+```
+
+Run it through the experiment manager:
+
+```powershell
+python -m src.cli run-experiment --artifact-id 1 --cluster-id 1 --conjecture-id 1 --command "python experiments/restricted_2dm/run_tiny_ordered_2dm_search.py --instances 200 --max-processes 3 --max-local-states 3 --objective safety --output results/ordered_2dm_tiny_search.json"
+```
+
 Run one bounded pipeline step:
 
 ```powershell

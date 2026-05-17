@@ -1,0 +1,22 @@
+You are extracting structured literature facts for a distributed-synthesis research harness.
+
+Read ONLY the provided paper text/PDF content. Do not use outside knowledge. Do not guess missing details.
+If a field is absent or ambiguous, set it to null and add a short note in `uncertainties`.
+
+Return VALID JSON with these top-level keys:
+- paper_summary
+- models
+- theorems
+- reductions
+- open_gaps
+
+Required extraction rules:
+1. Every theorem/reduction/model MUST include architecture assumptions, information assumptions, objective, and source location.
+2. If the paper uses causal memory / causal past / views / scheduler, record that explicitly.
+3. If the result depends on one environment player, central decision maker, acyclic/tree architecture, bounded players, bounded net, binary communication, or local omega-regular objectives, record it explicitly.
+4. If a complexity claim is stated, record exact class and whether it is upper bound, lower bound, or completeness.
+5. If a memory claim is stated, record the explicit bound formula if present.
+6. Split mixed claims into multiple entries when needed; do not compress unrelated claims into one theorem entry.
+7. Prefer theorem/definition labels and page numbers over free-form references.
+8. Use short evidence quotes/summaries only; do not copy long passages.
+

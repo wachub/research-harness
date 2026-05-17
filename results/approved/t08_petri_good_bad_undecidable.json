@@ -1,0 +1,28 @@
+{
+  "statement": "For Petri games with good and bad markings and at least two system players and one environment player, the existence of a winning strategy is undecidable.",
+  "theorem_type": "undecidability",
+  "model_family": "Petri_game",
+  "objective_family": "good_and_bad_markings",
+  "architecture_assumptions": [
+    "at least two system players",
+    "one environment player"
+  ],
+  "information_assumptions": [
+    "causal_memory"
+  ],
+  "strategy_assumptions": [
+    "system winning strategy"
+  ],
+  "process_bound": "at least two system players and one environment player",
+  "complexity_upper": null,
+  "complexity_lower": "undecidable",
+  "memory_upper": null,
+  "memory_lower": null,
+  "proof_technique": "PCP reduction; good markings force a synchronous-style encoding",
+  "source_paper_id": 4,
+  "source_location": "Theorem 10, page 20:16",
+  "confidence": "verified",
+  "cluster_id": 2,
+  "notes": "Seed approval artifact; verify evidence span before approval."
+}
+

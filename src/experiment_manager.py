@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import shlex
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,7 @@ def run_experiment(
 
     git_commit_hash = get_current_commit_hash()
     result_path = _next_result_path(results_dir)
+    declared_output_path = output_path or _infer_output_path(command)
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
         if db.get_code_artifact(connection, artifact_id) is None:
@@ -69,10 +71,11 @@ def run_experiment(
                 conjecture_id=conjecture_id,
                 experiment_type=experiment_type or "manual",
                 input_path=input_path,
-                output_path=output_path or str(result_path),
+                output_path=declared_output_path or str(result_path),
                 output_json={
                     "returncode": completed.returncode,
-                    "stdout_path": str(result_path),
+                    "stdout_stderr_path": str(result_path),
+                    "declared_output_path": declared_output_path,
                 },
                 result_summary=summary,
                 command_run=command,
@@ -81,6 +84,21 @@ def run_experiment(
             ),
         )
     return ExperimentExecution(run_id, completed.returncode, result_path, summary)
+
+
+def _infer_output_path(command: str) -> str | None:
+    try:
+        parts = shlex.split(command, posix=False)
+    except ValueError:
+        return None
+    for index, part in enumerate(parts):
+        if part in {"--output", "--output-json", "-o"} and index + 1 < len(parts):
+            return parts[index + 1].strip('"')
+        if part.startswith("--output="):
+            return part.split("=", 1)[1].strip('"')
+        if part.startswith("--output-json="):
+            return part.split("=", 1)[1].strip('"')
+    return None
 
 
 def _next_result_path(results_dir: str | Path | None = None) -> Path:

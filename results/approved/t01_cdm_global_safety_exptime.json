@@ -1,0 +1,29 @@
+{
+  "statement": "Global safety CDM games are EXPTIME-complete.",
+  "theorem_type": "complexity_complete",
+  "model_family": "CDM_game",
+  "objective_family": "global_safety",
+  "architecture_assumptions": [
+    "single central decision maker participates in every nondeterministic action",
+    "fixed-arity actions"
+  ],
+  "information_assumptions": [
+    "causal_memory",
+    "environment_is_scheduler"
+  ],
+  "strategy_assumptions": [
+    "distributed winning strategy"
+  ],
+  "process_bound": "finite but unbounded number of processes",
+  "complexity_upper": "EXPTIME",
+  "complexity_lower": "EXPTIME-hard",
+  "memory_upper": null,
+  "memory_lower": null,
+  "proof_technique": "reduction to sequential full-information safety game Gseq plus hardness transfer",
+  "source_paper_id": 1,
+  "source_location": "Theorem 26, pages 5:13-5:14",
+  "confidence": "verified",
+  "cluster_id": 1,
+  "notes": "Seed approval artifact; verify against the paper before final approval in a fresh database."
+}
+

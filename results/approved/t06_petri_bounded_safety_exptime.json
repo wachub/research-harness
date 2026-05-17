@@ -1,0 +1,29 @@
+{
+  "statement": "For bounded Petri games with one environment player and a bounded number of system players, deciding whether the system players have a winning strategy is EXPTIME-complete; if one exists, it can be constructed in exponential time.",
+  "theorem_type": "complexity_complete",
+  "model_family": "Petri_game",
+  "objective_family": "safety / bad_places",
+  "architecture_assumptions": [
+    "bounded Petri game",
+    "one environment player",
+    "bounded number of system players"
+  ],
+  "information_assumptions": [
+    "causal_memory via unfoldings and mcuts"
+  ],
+  "strategy_assumptions": [
+    "system winning strategy"
+  ],
+  "process_bound": "one environment plus bounded system players",
+  "complexity_upper": "EXPTIME",
+  "complexity_lower": "EXPTIME-hard",
+  "memory_upper": "finite winning strategy constructible",
+  "memory_lower": null,
+  "proof_technique": "exponential finite-graph game with mcuts; matching lower bound from combinatorial games",
+  "source_paper_id": 3,
+  "source_location": "Theorem 6.3, page 228 / page 11",
+  "confidence": "verified",
+  "cluster_id": 2,
+  "notes": "Seed approval artifact; verify evidence span before approval."
+}
+

@@ -14,6 +14,7 @@ def add_paper(
     year: int,
     venue: str | None = None,
     pdf_path: str | None = None,
+    url: str | None = None,
     notes: str | None = None,
     cluster_id: int | None = None,
     db_path: str | Path | None = None,
@@ -26,6 +27,7 @@ def add_paper(
         year=year,
         venue=venue,
         pdf_path=pdf_path,
+        url=url,
         notes=notes,
         cluster_id=cluster_id,
     )

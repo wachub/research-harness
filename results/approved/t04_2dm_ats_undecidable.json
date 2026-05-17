@@ -1,0 +1,29 @@
+{
+  "statement": "ATS games with two decision makers are undecidable.",
+  "theorem_type": "undecidability",
+  "model_family": "2DM_game / ATS_game",
+  "objective_family": "safety",
+  "architecture_assumptions": [
+    "two decision-making processes",
+    "reduction uses truly concurrent decisions"
+  ],
+  "information_assumptions": [
+    "causal_memory",
+    "causal_past"
+  ],
+  "strategy_assumptions": [
+    "distributed winning strategy"
+  ],
+  "process_bound": "fourteen-process safety ATS reduction with only two decision makers",
+  "complexity_upper": null,
+  "complexity_lower": "undecidable",
+  "memory_upper": null,
+  "memory_lower": null,
+  "proof_technique": "adaptation of asynchronous-control-game undecidability via infinite bipartite coloring",
+  "source_paper_id": 1,
+  "source_location": "Theorem 38 and discussion, pages 5:16-5:17",
+  "confidence": "verified",
+  "cluster_id": 1,
+  "notes": "Seed approval artifact; verify source location before approval."
+}
+

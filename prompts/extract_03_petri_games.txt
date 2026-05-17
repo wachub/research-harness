@@ -1,0 +1,2 @@
+Prioritize Petri-game model definition, causal-memory explanation, Theorem 6.3, Theorem 6.4, and any references to one-environment-player assumptions.
+

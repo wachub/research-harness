@@ -86,3 +86,4 @@ def test_experiment_run_records_output_file(tmp_path):
     assert run.result_summary == "success"
     assert run.command_run == command
     assert run.output_json["returncode"] == 0
+    assert "stdout_stderr_path" in run.output_json

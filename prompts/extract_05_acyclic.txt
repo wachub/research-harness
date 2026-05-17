@@ -1,0 +1,2 @@
+Prioritize Theorem 6, Theorem 13, assumptions on acyclic communication graphs, local omega-regular specifications, and depth-sensitive complexity remarks from intro/conclusion.
+

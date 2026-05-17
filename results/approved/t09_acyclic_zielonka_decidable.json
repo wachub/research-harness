@@ -1,0 +1,30 @@
+{
+  "statement": "The control problem for Zielonka automata over distributed alphabets with acyclic architecture is decidable, and a controller can be effectively constructed; the paper states non-elementary complexity in general, EXPTIME at depth 1, and k-EXPTIME at depth k.",
+  "theorem_type": "decidability",
+  "model_family": "Zielonka_automaton / control_game",
+  "objective_family": "local_omega_regular",
+  "architecture_assumptions": [
+    "acyclic communication graph",
+    "local omega-regular correctness conditions",
+    "uncontrollable communication allowed",
+    "binary communications"
+  ],
+  "information_assumptions": [
+    "causal_memory through rendezvous synchronization"
+  ],
+  "strategy_assumptions": [
+    "constructive controller"
+  ],
+  "process_bound": "arbitrary finite tree depth k",
+  "complexity_upper": "decidable; EXPTIME at depth 1; k-EXPTIME at depth k; non-elementary overall",
+  "complexity_lower": null,
+  "memory_upper": "constructive controller",
+  "memory_lower": null,
+  "proof_technique": "inductive elimination of a leaf process using covering controllers and r-short automata",
+  "source_paper_id": 5,
+  "source_location": "Theorem 6 plus intro/conclusion complexity remarks",
+  "confidence": "verified",
+  "cluster_id": 3,
+  "notes": "Seed approval artifact; verify source labels before approval."
+}
+

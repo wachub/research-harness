@@ -1,0 +1,28 @@
+{
+  "statement": "Local parity CDM games are EXPTIME-complete.",
+  "theorem_type": "complexity_complete",
+  "model_family": "CDM_game",
+  "objective_family": "local_parity",
+  "architecture_assumptions": [
+    "single central decision maker participates in every nondeterministic action"
+  ],
+  "information_assumptions": [
+    "causal_memory",
+    "views"
+  ],
+  "strategy_assumptions": [
+    "distributed winning strategy"
+  ],
+  "process_bound": "finite but unbounded number of processes",
+  "complexity_upper": "EXPTIME",
+  "complexity_lower": "EXPTIME-hard",
+  "memory_upper": null,
+  "memory_lower": null,
+  "proof_technique": "reduction to parity game on sequential arena",
+  "source_paper_id": 1,
+  "source_location": "Theorem 30, page 5:14",
+  "confidence": "verified",
+  "cluster_id": 1,
+  "notes": "Seed approval artifact; verify evidence span before approval."
+}
+

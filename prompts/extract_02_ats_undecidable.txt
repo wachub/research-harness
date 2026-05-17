@@ -1,0 +1,2 @@
+Prioritize ATS-game definition, distributed strategy definition, ATS-to-asynchronous-game equivalence claim, undecidability statement, and the six-process safety transfer remark.
+

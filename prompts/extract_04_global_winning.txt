@@ -1,0 +1,2 @@
+Prioritize the abstract split between global bad markings vs good-and-bad markings; Theorem 8, Theorem 10, Theorem 11; extract the Buechi-game reduction and PCP reduction techniques.
+

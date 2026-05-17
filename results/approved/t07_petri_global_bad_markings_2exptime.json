@@ -1,0 +1,29 @@
+{
+  "statement": "For Petri games with a bounded number of system players, one environment player, and bad markings, the existence of a winning strategy is decidable in 2-EXPTIME; if one exists, it can be constructed in exponential time.",
+  "theorem_type": "complexity_upper",
+  "model_family": "Petri_game",
+  "objective_family": "global_safety / bad_markings",
+  "architecture_assumptions": [
+    "bounded number of system players",
+    "one environment player"
+  ],
+  "information_assumptions": [
+    "causal_memory",
+    "finite causal history until last environment synchronization"
+  ],
+  "strategy_assumptions": [
+    "system winning strategy"
+  ],
+  "process_bound": "bounded system players; one environment player",
+  "complexity_upper": "2-EXPTIME",
+  "complexity_lower": null,
+  "memory_upper": "finite winning strategy constructible",
+  "memory_lower": null,
+  "proof_technique": "reduction to complete-observation Buechi game",
+  "source_paper_id": 4,
+  "source_location": "Theorem 8, page 20:13",
+  "confidence": "verified",
+  "cluster_id": 2,
+  "notes": "Seed approval artifact; verify evidence span before approval."
+}
+

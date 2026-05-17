@@ -42,18 +42,21 @@ TheoremType = Literal[
     "undecidability",
     "complexity_upper",
     "complexity_lower",
+    "complexity_complete",
     "completeness",
     "memory_upper",
     "memory_lower",
     "equivalence",
     "characterization",
     "algorithm",
+    "construction",
 ]
 Confidence = Literal["pending", "verified", "rejected", "needs_review"]
 ReviewStatus = Literal["draft", "active", "closed", "refuted", "proved", "paused", "abandoned"]
 ConjectureExpectedStatus = Literal["true", "false", "unknown"]
 ArtifactType = Literal[
     "library",
+    "python_module",
     "solver",
     "generator",
     "reduction",
@@ -129,6 +132,7 @@ class Paper(StrictBase):
     year: int = Field(ge=1800, le=3000)
     venue: str | None = None
     pdf_path: str | None = None
+    url: str | None = None
     notes: str | None = None
     cluster_id: int | None = None
 
@@ -330,7 +334,10 @@ class CodeArtifact(StrictBase):
     name: str = Field(min_length=1)
     path: str = Field(min_length=1)
     artifact_type: ArtifactType
+    entrypoint: str | None = None
+    language: str | None = None
     description: str | None = None
+    cluster_id: int | None = None
     related_concepts: list[int | str] = Field(default_factory=list)
     related_conjectures: list[int] = Field(default_factory=list)
     tests_path: str | None = None

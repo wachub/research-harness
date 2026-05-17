@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_paper_parser.add_argument("--year", required=True, type=int)
     add_paper_parser.add_argument("--venue")
     add_paper_parser.add_argument("--pdf-path")
+    add_paper_parser.add_argument("--url")
     add_paper_parser.add_argument("--notes")
     add_paper_parser.add_argument("--cluster-id", type=int)
 
@@ -52,26 +53,47 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser = subparsers.add_parser("extract-from-text", help="Extract entries into pending queue")
     extract_parser.add_argument("--text", help="Text to extract from")
     extract_parser.add_argument("--file", help="Text file to extract from")
+    extract_parser.add_argument("--prompt-file", help="Prompt file to prepend to the extraction text")
+    extract_parser.add_argument("--paper-id", type=int, help="Source paper id to attach to extracted candidates")
+    extract_parser.add_argument("--output-json", help="Write extraction metadata to this JSON path")
+
+    pdf_extract_parser = subparsers.add_parser("extract-from-pdf", help="Extract entries from a local PDF into pending queue")
+    pdf_extract_parser.add_argument("--paper-id", type=int, required=True)
+    pdf_extract_parser.add_argument("--pdf", required=True)
+    pdf_extract_parser.add_argument("--prompt-file")
+    pdf_extract_parser.add_argument("--output-json")
 
     pending_parser = subparsers.add_parser("list-pending", help="List pending entries")
     pending_parser.add_argument("--status", default="pending", help="pending, flagged, approved, rejected, or all")
+    pending_parser.add_argument("--entry-type", help="Filter by entry type")
 
-    subparsers.add_parser("curate-pending", help="Analyze pending entries and print warnings")
+    curate_parser = subparsers.add_parser("curate-pending", help="Analyze pending entries and print warnings")
+    curate_parser.add_argument("--entry-type", help="Filter by entry type")
+    curate_parser.add_argument("--output-report", help="Write a markdown curation report")
 
     detail_parser = subparsers.add_parser("show-pending-detail", help="Show one pending entry as JSON")
-    detail_parser.add_argument("entry_id", type=int)
+    detail_parser.add_argument("entry_id", nargs="?", type=int)
+    detail_parser.add_argument("--pending-id", type=int)
+
+    show_pending_parser = subparsers.add_parser("show-pending", help="Show one pending entry as JSON")
+    show_pending_parser.add_argument("entry_id", nargs="?", type=int)
+    show_pending_parser.add_argument("--pending-id", type=int)
 
     approve_parser = subparsers.add_parser("approve-pending", help="Approve a pending entry")
-    approve_parser.add_argument("entry_id", type=int)
+    approve_parser.add_argument("entry_id", nargs="?", type=int)
+    approve_parser.add_argument("--pending-id", type=int)
+    approve_parser.add_argument("--edits-file", help="JSON file whose payload replaces the pending payload before approval")
     approve_parser.add_argument("--reject", action="store_true", help="Compatibility: reject instead of approving")
     approve_parser.add_argument("--reason", help="Compatibility rejection reason")
 
     reject_parser = subparsers.add_parser("reject-pending", help="Reject a pending entry")
-    reject_parser.add_argument("entry_id", type=int)
+    reject_parser.add_argument("entry_id", nargs="?", type=int)
+    reject_parser.add_argument("--pending-id", type=int)
     reject_parser.add_argument("--reason")
 
     flag_parser = subparsers.add_parser("flag-pending", help="Flag a pending entry for later review")
-    flag_parser.add_argument("entry_id", type=int)
+    flag_parser.add_argument("entry_id", nargs="?", type=int)
+    flag_parser.add_argument("--pending-id", type=int)
     flag_parser.add_argument("--reason", required=True)
 
     cluster_parser = subparsers.add_parser("add-cluster", help="Add a research cluster")
@@ -142,6 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
     conjecture_parser = subparsers.add_parser("add-conjecture", help="Add a conjecture")
     conjecture_parser.add_argument("--statement", required=True)
     conjecture_parser.add_argument("--title")
+    conjecture_parser.add_argument("--description")
+    conjecture_parser.add_argument("--priority", type=int)
     conjecture_parser.add_argument("--cluster-id", type=int)
     conjecture_parser.add_argument("--motivation")
     conjecture_parser.add_argument("--expected-status", default="unknown", choices=["true", "false", "unknown"])
@@ -155,7 +179,8 @@ def build_parser() -> argparse.ArgumentParser:
     list_conjectures_parser.add_argument("--cluster-id", type=int)
 
     show_conjecture_parser = subparsers.add_parser("show-conjecture", help="Show a conjecture")
-    show_conjecture_parser.add_argument("conjecture_id", type=int)
+    show_conjecture_parser.add_argument("conjecture_id", nargs="?", type=int)
+    show_conjecture_parser.add_argument("--conjecture-id", type=int, dest="conjecture_id_flag")
 
     update_conjecture_parser = subparsers.add_parser("update-conjecture-status", help="Update conjecture status")
     update_conjecture_parser.add_argument("conjecture_id", type=int)
@@ -183,9 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
     artifact_parser.add_argument(
         "--artifact-type",
         required=True,
-        choices=["library", "solver", "generator", "reduction", "checker", "proof_check", "experiment_script"],
+        choices=["library", "python_module", "solver", "generator", "reduction", "checker", "proof_check", "experiment_script"],
     )
+    artifact_parser.add_argument("--entrypoint")
+    artifact_parser.add_argument("--language")
     artifact_parser.add_argument("--description")
+    artifact_parser.add_argument("--cluster-id", type=int)
     artifact_parser.add_argument("--related-concepts", default="", help="Semicolon-separated concept ids or names")
     artifact_parser.add_argument("--related-conjectures", default="", help="Semicolon-separated conjecture ids")
     artifact_parser.add_argument("--tests-path")
@@ -214,9 +242,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_experiment_parser.add_argument("--notes")
 
     subparsers.add_parser("list-experiment-runs", help="List experiment runs")
+    subparsers.add_parser("list-experiments", help="List experiment runs")
 
     show_run_parser = subparsers.add_parser("show-experiment-run", help="Show one experiment run")
     show_run_parser.add_argument("--run-id", required=True, type=int)
+
+    show_experiment_parser = subparsers.add_parser("show-experiment", help="Show one experiment run")
+    show_experiment_parser.add_argument("--run-id", required=True, type=int)
 
     return parser
 
@@ -238,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
             year=args.year,
             venue=args.venue,
             pdf_path=args.pdf_path,
+            url=args.url,
             notes=args.notes,
             cluster_id=args.cluster_id,
             db_path=args.db,
@@ -257,11 +290,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "extract-from-text":
-        text = _read_text_arg(args.text, args.file)
+        text = _with_prompt(_read_text_arg(args.text, args.file), args.prompt_file)
         client = LLMClient()
         entry_ids = extract_from_text(text, db_path=args.db, client=client)
+        if args.paper_id:
+            _annotate_pending_paper(args.db, entry_ids, args.paper_id)
+        if args.output_json:
+            _write_json(Path(args.output_json), {"pending_entry_ids": entry_ids, "paper_id": args.paper_id})
         mode = "dry-run" if client.dry_run else "provider"
         print(f"Inserted pending entries ({mode}): {', '.join(str(entry_id) for entry_id in entry_ids)}")
+        return 0
+
+    if args.command == "extract-from-pdf":
+        text = _with_prompt(_read_pdfish_text(Path(args.pdf)), args.prompt_file)
+        client = LLMClient()
+        entry_ids = extract_from_text(text, db_path=args.db, client=client)
+        _annotate_pending_paper(args.db, entry_ids, args.paper_id)
+        if args.output_json:
+            _write_json(
+                Path(args.output_json),
+                {"pending_entry_ids": entry_ids, "paper_id": args.paper_id, "pdf": args.pdf},
+            )
+        mode = "dry-run" if client.dry_run else "provider"
+        print(f"Inserted pending entries from PDF ({mode}): {', '.join(str(entry_id) for entry_id in entry_ids)}")
         return 0
 
     if args.command == "list-pending":
@@ -269,6 +320,8 @@ def main(argv: list[str] | None = None) -> int:
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
             entries = db.list_pending_entries(connection, status=status)
+        if args.entry_type:
+            entries = [entry for entry in entries if entry.entry_type == args.entry_type]
         for entry in entries:
             title = entry.payload.get("title") or entry.payload.get("name") or entry.payload.get("summary") or "(untitled)"
             warning_text = f" warnings={entry.warnings}" if entry.warnings else ""
@@ -276,7 +329,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "curate-pending":
-        for analysis in curate_pending(db_path=args.db):
+        analyses = curate_pending(db_path=args.db)
+        if args.entry_type:
+            analyses = [analysis for analysis in analyses if analysis.entry.entry_type == args.entry_type]
+        if args.output_report:
+            _write_curation_report(Path(args.output_report), analyses)
+        for analysis in analyses:
             title = analysis.entry.payload.get("title") or analysis.entry.payload.get("name") or "(untitled)"
             print(f"{analysis.entry.id}: {analysis.entry.entry_type} {title}")
             if analysis.warnings:
@@ -286,34 +344,40 @@ def main(argv: list[str] | None = None) -> int:
                 print("  duplicates: " + dupes)
         return 0
 
-    if args.command == "show-pending-detail":
+    if args.command in {"show-pending-detail", "show-pending"}:
+        entry_id = _resolve_id(args.entry_id, args.pending_id, "pending id")
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
-            entry = db.get_pending_entry(connection, args.entry_id)
+            entry = db.get_pending_entry(connection, entry_id)
         if entry is None:
-            raise SystemExit(f"pending entry {args.entry_id} does not exist")
+            raise SystemExit(f"pending entry {entry_id} does not exist")
         print(json.dumps(entry.model_dump(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "approve-pending":
+        entry_id = _resolve_id(args.entry_id, args.pending_id, "pending id")
         if args.reject:
-            reject_pending(args.entry_id, reason=args.reason, db_path=args.db)
-            print(f"Rejected pending entry {args.entry_id}")
+            reject_pending(entry_id, reason=args.reason, db_path=args.db)
+            print(f"Rejected pending entry {entry_id}")
             return 0
-        result = approve_pending(args.entry_id, db_path=args.db)
+        if args.edits_file:
+            _replace_pending_payload_from_file(args.db, entry_id, Path(args.edits_file))
+        result = approve_pending(entry_id, db_path=args.db)
         print(f"Approved pending entry {result.pending_id} into {result.inserted_table}:{result.inserted_id}")
         if result.warnings:
             print("Warnings: " + "; ".join(result.warnings))
         return 0
 
     if args.command == "reject-pending":
-        reject_pending(args.entry_id, reason=args.reason, db_path=args.db)
-        print(f"Rejected pending entry {args.entry_id}")
+        entry_id = _resolve_id(args.entry_id, args.pending_id, "pending id")
+        reject_pending(entry_id, reason=args.reason, db_path=args.db)
+        print(f"Rejected pending entry {entry_id}")
         return 0
 
     if args.command == "flag-pending":
-        flag_pending(args.entry_id, reason=args.reason, db_path=args.db)
-        print(f"Flagged pending entry {args.entry_id}")
+        entry_id = _resolve_id(args.entry_id, args.pending_id, "pending id")
+        flag_pending(entry_id, reason=args.reason, db_path=args.db)
+        print(f"Flagged pending entry {entry_id}")
         return 0
 
     if args.command == "add-cluster":
@@ -413,13 +477,13 @@ def main(argv: list[str] | None = None) -> int:
                     title=args.title,
                     statement=args.statement,
                     cluster_id=args.cluster_id,
-                    motivation=args.motivation,
+                    motivation=args.motivation or args.description,
                     expected_status=args.expected_status,
                     confidence=args.confidence,
                     attack_plan=args.attack_plan,
                     possible_counterexamples=_split_semicolon(args.possible_counterexamples),
                     status=args.status,
-                    notes=args.notes,
+                    notes=_combine_notes(args.notes, f"priority={args.priority}" if args.priority is not None else None),
                 ),
             )
         print(f"Added conjecture {conjecture_id}")
@@ -435,11 +499,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "show-conjecture":
+        conjecture_id = _resolve_id(args.conjecture_id, args.conjecture_id_flag, "conjecture id")
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
-            conjecture = db.get_conjecture(connection, args.conjecture_id)
+            conjecture = db.get_conjecture(connection, conjecture_id)
         if conjecture is None:
-            raise SystemExit(f"conjecture {args.conjecture_id} does not exist")
+            raise SystemExit(f"conjecture {conjecture_id} does not exist")
         print(json.dumps(conjecture.model_dump(), indent=2, sort_keys=True))
         return 0
 
@@ -487,7 +552,10 @@ def main(argv: list[str] | None = None) -> int:
             name=args.name,
             path=args.path,
             artifact_type=args.artifact_type,
+            entrypoint=args.entrypoint,
+            language=args.language,
             description=args.description,
+            cluster_id=args.cluster_id,
             related_concepts=_split_semicolon(args.related_concepts),
             related_conjectures=_split_ints(args.related_conjectures),
             tests_path=args.tests_path,
@@ -538,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if args.command == "list-experiment-runs":
+    if args.command in {"list-experiment-runs", "list-experiments"}:
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
             runs = db.list_experiment_runs(connection)
@@ -547,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{run.run_id}: {run.experiment_type} {run.result_summary or ''}{artifact}")
         return 0
 
-    if args.command == "show-experiment-run":
+    if args.command in {"show-experiment-run", "show-experiment"}:
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
             run = db.get_experiment_run(connection, args.run_id)
@@ -625,6 +693,84 @@ def _split_ints(value: str | None) -> list[int]:
     if not value:
         return []
     return [int(item.strip()) for item in value.split(";") if item.strip()]
+
+
+def _resolve_id(positional: int | None, named: int | None, label: str) -> int:
+    resolved = named if named is not None else positional
+    if resolved is None:
+        raise SystemExit(f"missing {label}")
+    return resolved
+
+
+def _with_prompt(text: str, prompt_file: str | None) -> str:
+    if prompt_file is None:
+        return text
+    prompt = Path(prompt_file).read_text(encoding="utf-8")
+    return f"{prompt}\n\n--- SOURCE TEXT ---\n{text}"
+
+
+def _read_pdfish_text(path: Path) -> str:
+    if not path.exists():
+        raise SystemExit(f"PDF does not exist: {path}")
+    data = path.read_bytes()
+    # This is a dependency-free MVP fallback. Real PDF extraction can be swapped
+    # in later; pending entries still require human curation.
+    return data.decode("utf-8", errors="replace")
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _annotate_pending_paper(db_path: str, entry_ids: list[int], paper_id: int) -> None:
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        for entry_id in entry_ids:
+            entry = db.get_pending_entry(connection, entry_id)
+            if entry is None:
+                continue
+            payload = dict(entry.payload)
+            payload.setdefault("paper_id", paper_id)
+            payload.setdefault("source_paper_id", paper_id)
+            db.update_pending_payload(connection, entry_id, payload)
+
+
+def _replace_pending_payload_from_file(db_path: str, entry_id: int, edits_file: Path) -> None:
+    payload = json.loads(edits_file.read_text(encoding="utf-8"))
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        entry = db.get_pending_entry(connection, entry_id)
+        if entry is None:
+            raise SystemExit(f"pending entry {entry_id} does not exist")
+        warnings = [warning for warning in entry.warnings if warning != "dry-run extraction"]
+        db.update_pending_payload(connection, entry_id, payload, warnings=warnings)
+
+
+def _write_curation_report(path: Path, analyses) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Pending Entry Curation Report", ""]
+    for analysis in analyses:
+        title = analysis.entry.payload.get("title") or analysis.entry.payload.get("name") or "(untitled)"
+        lines.append(f"## {analysis.entry.id}: {analysis.entry.entry_type} - {title}")
+        if analysis.warnings:
+            lines.append("")
+            lines.append("Warnings:")
+            lines.extend(f"- {warning}" for warning in analysis.warnings)
+        if analysis.duplicates:
+            lines.append("")
+            lines.append("Possible duplicates:")
+            lines.extend(
+                f"- {duplicate.table}:{duplicate.entry_id} score={duplicate.score:.2f} {duplicate.title}"
+                for duplicate in analysis.duplicates
+            )
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _combine_notes(*parts: str | None) -> str | None:
+    values = [part for part in parts if part]
+    return "\n".join(values) if values else None
 
 
 def _read_text_arg(text: str | None, file_path: str | None) -> str:
