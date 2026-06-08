@@ -318,7 +318,7 @@ class EvidenceSpan(StrictBase):
 
     evidence_id: int | None = None
     paper_id: int
-    entry_type: Literal["theorem", "model", "reduction", "open_problem", "derived_result", "concept"]
+    entry_type: Literal["theorem", "model", "reduction", "open_problem", "derived_result", "concept", "literature_note"]
     entry_id: int
     page_start: int | None = None
     page_end: int | None = None
@@ -362,6 +362,43 @@ class ExperimentRun(StrictBase):
     command_run: str | None = None
     git_commit_hash: str | None = None
     notes: str | None = None
+
+
+class ResearchTopic(StrictBase):
+    """An idea-specific literature review topic and its clarified scope."""
+
+    id: int | None = None
+    title: str = Field(min_length=1)
+    raw_topic: str = Field(min_length=1)
+    clarified_topic: str = Field(min_length=1)
+    clarification_json: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+
+
+class LiteratureNote(StrictBase):
+    """A local literature note backed by a paper, seed file, or approved artifact."""
+
+    id: int | None = None
+    topic_id: int
+    paper_id: int | None = None
+    source_path: str = Field(min_length=1)
+    note_type: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    content_json: dict[str, Any] = Field(default_factory=dict)
+    markdown_note: str = Field(min_length=1)
+    created_at: str | None = None
+
+
+class LiteratureSummary(StrictBase):
+    """A deterministic idea-specific summary derived from a literature note."""
+
+    id: int | None = None
+    topic_id: int
+    note_id: int | None = None
+    paper_id: int | None = None
+    summary_json: dict[str, Any] = Field(default_factory=dict)
+    markdown_summary: str = Field(min_length=1)
+    created_at: str | None = None
 
 
 SCHEMA_BY_ENTRY_TYPE: dict[EntryType, type[StrictBase]] = {

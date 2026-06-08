@@ -104,6 +104,26 @@ python -m src.cli flag-pending 3 --reason "Needs exact theorem number"
 
 The curator warns about missing source locations, missing assumptions, duplicate statements, vague complexity language, decidability claims without architecture/information assumptions, and alias collisions in concepts.
 
+## Literature Research Demo
+
+Run the local vertical-slice literature workflow from approved seed artifacts:
+
+```powershell
+python -m src.cli research-demo --dry-run
+python -m src.cli query-literature --topic-id 1 --question "What is known about global safety in CDM or ATS games?"
+python -m src.cli research-memo --topic-id 1 --question "Does causal ordering in two-decision-maker ATS/CDM games plausibly recover decidability for distributed safety synthesis?"
+python -m src.cli quality-check-literature --topic-id 1
+python -m src.cli generate-verification-tasks --topic-id 1
+```
+
+The demo creates a research topic for causally ordered two-decision-maker ATS/CDM safety synthesis, loads local approved seed JSON files from `results/approved/`, stores literature notes and summaries in SQLite, links evidence spans, and writes `results/literature/demo_literature_map.md`.
+
+`research-memo` writes `results/literature/topic_<id>_research_memo.md` from stored evidence only. New conjectures are labelled as conjectures, and unsupported points are labelled `needs verification`.
+
+`quality-check-literature` writes a local quality report for the notes, summaries, evidence spans, map, memo, and query robustness checks. `generate-verification-tasks` writes literature/theory checking tasks; it does not suggest experiments.
+
+No new theorem-like claim is inserted into approved theorem tables by the demo. The report uses stored seed material and marks unresolved points as needing verification. See [docs/literature_workflow.md](docs/literature_workflow.md).
+
 ## Research Map Queries
 
 ```powershell

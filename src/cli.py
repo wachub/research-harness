@@ -21,6 +21,13 @@ from .experiments.ats_brute_solver import find_memoryless_safety_strategy
 from .experiments.ats_generator import generate_tiny_game
 from .experiments.ats_models import SafetyGame
 from .ingest import add_paper
+from .literature import (
+    generate_verification_tasks,
+    quality_check_literature,
+    query_literature,
+    run_research_demo,
+    write_research_memo,
+)
 from .orchestrator import run_pipeline
 from .schemas import Concept, ConceptLink, Conjecture, ResearchCluster
 
@@ -49,6 +56,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_papers_parser = subparsers.add_parser("list-papers", help="List papers")
     list_papers_parser.add_argument("--cluster-id", type=int)
+
+    demo_parser = subparsers.add_parser(
+        "research-demo",
+        help="Run a local dry-run literature workflow from approved seed assets",
+    )
+    demo_parser.add_argument("--dry-run", action="store_true", help="Use only local seed assets")
+    demo_parser.add_argument("--output", help="Markdown report path")
+    demo_parser.add_argument("--approved-dir", help="Directory containing approved seed JSON files")
+
+    query_parser = subparsers.add_parser(
+        "query-literature",
+        help="Answer from stored literature summaries and evidence for a topic",
+    )
+    query_parser.add_argument("--topic-id", required=True, type=int)
+    query_parser.add_argument("--question", required=True)
+    query_parser.add_argument("--max-results", default=5, type=int)
+
+    memo_parser = subparsers.add_parser(
+        "research-memo",
+        help="Write a stored-evidence research memo for one topic and question",
+    )
+    memo_parser.add_argument("--topic-id", required=True, type=int)
+    memo_parser.add_argument("--question", required=True)
+    memo_parser.add_argument("--output", help="Markdown memo path")
+    memo_parser.add_argument("--llm", action="store_true", help="Use OPENAI_API_KEY only to organize stored evidence")
+
+    quality_parser = subparsers.add_parser(
+        "quality-check-literature",
+        help="Write a quality report for stored literature evidence and memo outputs",
+    )
+    quality_parser.add_argument("--topic-id", required=True, type=int)
+    quality_parser.add_argument("--output", help="Markdown quality report path")
+
+    verification_parser = subparsers.add_parser(
+        "generate-verification-tasks",
+        help="Write literature/theory verification tasks from stored evidence",
+    )
+    verification_parser.add_argument("--topic-id", required=True, type=int)
+    verification_parser.add_argument("--output", help="Markdown verification task path")
 
     extract_parser = subparsers.add_parser("extract-from-text", help="Extract entries into pending queue")
     extract_parser.add_argument("--text", help="Text to extract from")
@@ -287,6 +333,74 @@ def main(argv: list[str] | None = None) -> int:
             cluster = f" cluster={paper.cluster_id}" if paper.cluster_id else ""
             venue = f", {paper.venue}" if paper.venue else ""
             print(f"{paper.id}: {paper.title} ({paper.year}{venue}) - {authors}{cluster}")
+        return 0
+
+    if args.command == "research-demo":
+        result = run_research_demo(
+            dry_run=args.dry_run,
+            approved_dir=args.approved_dir,
+            output_path=args.output,
+            db_path=args.db,
+        )
+        print(
+            "Research demo complete: "
+            f"topic_id={result.topic_id} "
+            f"topics_created={result.topics_created} "
+            f"papers_notes_loaded={result.notes_loaded} "
+            f"summaries_created={result.summaries_created} "
+            f"evidence_spans_linked={result.evidence_spans_linked} "
+            f"output_files_written={result.output_files_written} "
+            f"report={result.report_path}"
+        )
+        return 0
+
+    if args.command == "query-literature":
+        result = query_literature(
+            topic_id=args.topic_id,
+            question=args.question,
+            max_results=args.max_results,
+            db_path=args.db,
+        )
+        print(result.answer)
+        return 0
+
+    if args.command == "research-memo":
+        result = write_research_memo(
+            topic_id=args.topic_id,
+            question=args.question,
+            output_path=args.output,
+            use_llm=args.llm,
+            db_path=args.db,
+        )
+        mode = "llm-organized" if result.used_llm else "stored-evidence"
+        print(
+            f"Wrote research memo topic_id={result.topic_id} "
+            f"evidence_count={result.evidence_count} mode={mode} path={result.memo_path}"
+        )
+        return 0
+
+    if args.command == "quality-check-literature":
+        result = quality_check_literature(
+            topic_id=args.topic_id,
+            output_path=args.output,
+            db_path=args.db,
+        )
+        print(
+            f"Wrote quality report topic_id={result.topic_id} "
+            f"issues={result.issue_count} path={result.report_path}"
+        )
+        return 0
+
+    if args.command == "generate-verification-tasks":
+        result = generate_verification_tasks(
+            topic_id=args.topic_id,
+            output_path=args.output,
+            db_path=args.db,
+        )
+        print(
+            f"Wrote verification tasks topic_id={result.topic_id} "
+            f"tasks={result.task_count} path={result.tasks_path}"
+        )
         return 0
 
     if args.command == "extract-from-text":
@@ -693,6 +807,11 @@ def _split_ints(value: str | None) -> list[int]:
     if not value:
         return []
     return [int(item.strip()) for item in value.split(";") if item.strip()]
+
+
+def _print_warnings(warnings: list[str]) -> None:
+    for warning in warnings:
+        print(f"warning: {warning}")
 
 
 def _resolve_id(positional: int | None, named: int | None, label: str) -> int:

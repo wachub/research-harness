@@ -15,6 +15,8 @@ from .schemas import (
     DerivedResult,
     EvidenceSpan,
     ExperimentRun,
+    LiteratureNote,
+    LiteratureSummary,
     Model,
     OpenProblem,
     Paper,
@@ -22,6 +24,7 @@ from .schemas import (
     ProofAttempt,
     Reduction,
     ResearchCluster,
+    ResearchTopic,
     Theorem,
 )
 
@@ -182,6 +185,42 @@ def create_tables(connection: sqlite3.Connection) -> None:
             cluster_id INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(cluster_id) REFERENCES research_clusters(cluster_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS research_topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            raw_topic TEXT NOT NULL,
+            clarified_topic TEXT NOT NULL,
+            clarification_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS literature_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id INTEGER NOT NULL,
+            paper_id INTEGER,
+            source_path TEXT NOT NULL,
+            note_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content_json TEXT NOT NULL,
+            markdown_note TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(topic_id) REFERENCES research_topics(id),
+            FOREIGN KEY(paper_id) REFERENCES papers(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS literature_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id INTEGER NOT NULL,
+            note_id INTEGER,
+            paper_id INTEGER,
+            summary_json TEXT NOT NULL,
+            markdown_summary TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(topic_id) REFERENCES research_topics(id),
+            FOREIGN KEY(note_id) REFERENCES literature_notes(id),
+            FOREIGN KEY(paper_id) REFERENCES papers(id)
         );
 
         CREATE TABLE IF NOT EXISTS models (
@@ -381,6 +420,43 @@ def _migrate_existing_tables(connection: sqlite3.Connection) -> None:
         connection,
         "papers",
         {"cluster_id": "INTEGER", "url": "TEXT"},
+    )
+    _add_missing_columns(
+        connection,
+        "research_topics",
+        {
+            "title": "TEXT NOT NULL DEFAULT 'Untitled topic'",
+            "raw_topic": "TEXT NOT NULL DEFAULT ''",
+            "clarified_topic": "TEXT NOT NULL DEFAULT ''",
+            "clarification_json": "TEXT NOT NULL DEFAULT '{}'",
+            "created_at": "TEXT",
+        },
+    )
+    _add_missing_columns(
+        connection,
+        "literature_notes",
+        {
+            "topic_id": "INTEGER",
+            "paper_id": "INTEGER",
+            "source_path": "TEXT NOT NULL DEFAULT ''",
+            "note_type": "TEXT NOT NULL DEFAULT 'note'",
+            "title": "TEXT NOT NULL DEFAULT 'Untitled note'",
+            "content_json": "TEXT NOT NULL DEFAULT '{}'",
+            "markdown_note": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "TEXT",
+        },
+    )
+    _add_missing_columns(
+        connection,
+        "literature_summaries",
+        {
+            "topic_id": "INTEGER",
+            "note_id": "INTEGER",
+            "paper_id": "INTEGER",
+            "summary_json": "TEXT NOT NULL DEFAULT '{}'",
+            "markdown_summary": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "TEXT",
+        },
     )
     _add_missing_columns(
         connection,
@@ -728,6 +804,149 @@ def list_papers(connection: sqlite3.Connection, cluster_id: int | None = None) -
             (cluster_id,),
         ).fetchall()
     return [_row_to_paper(row) for row in rows]
+
+
+def get_paper(connection: sqlite3.Connection, paper_id: int) -> Paper | None:
+    """Fetch one paper by id."""
+
+    row = connection.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
+    return _row_to_paper(row) if row else None
+
+
+def find_paper_by_normalized_title(connection: sqlite3.Connection, title: str) -> Paper | None:
+    """Find a paper by a conservative normalized title comparison."""
+
+    needle = _normalize_title(title)
+    for paper in list_papers(connection):
+        if _normalize_title(paper.title) == needle:
+            return paper
+    return None
+
+
+def update_paper_pdf_path(connection: sqlite3.Connection, paper_id: int, pdf_path: str) -> None:
+    """Attach a local PDF path to an existing paper record."""
+
+    connection.execute("UPDATE papers SET pdf_path = ? WHERE id = ?", (pdf_path, paper_id))
+
+
+def insert_research_topic(connection: sqlite3.Connection, topic: ResearchTopic) -> int:
+    """Insert a clarified literature review topic and return its id."""
+
+    connection.execute(
+        """
+        INSERT INTO research_topics (title, raw_topic, clarified_topic, clarification_json)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            topic.title,
+            topic.raw_topic,
+            topic.clarified_topic,
+            _json_dumps(topic.clarification_json),
+        ),
+    )
+    return _last_insert_id(connection)
+
+
+def get_research_topic(connection: sqlite3.Connection, topic_id: int) -> ResearchTopic | None:
+    """Fetch one literature review topic."""
+
+    row = connection.execute("SELECT * FROM research_topics WHERE id = ?", (topic_id,)).fetchone()
+    return _row_to_research_topic(row) if row else None
+
+
+def list_research_topics(connection: sqlite3.Connection) -> list[ResearchTopic]:
+    """List literature review topics ordered by insertion id."""
+
+    rows = connection.execute("SELECT * FROM research_topics ORDER BY id").fetchall()
+    return [_row_to_research_topic(row) for row in rows]
+
+
+def insert_literature_note(connection: sqlite3.Connection, note: LiteratureNote) -> int:
+    """Insert a local literature note and return its id."""
+
+    connection.execute(
+        """
+        INSERT INTO literature_notes (
+            topic_id, paper_id, source_path, note_type, title, content_json, markdown_note
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            note.topic_id,
+            note.paper_id,
+            note.source_path,
+            note.note_type,
+            note.title,
+            _json_dumps(note.content_json),
+            note.markdown_note,
+        ),
+    )
+    return _last_insert_id(connection)
+
+
+def list_literature_notes(
+    connection: sqlite3.Connection,
+    topic_id: int | None = None,
+    paper_id: int | None = None,
+) -> list[LiteratureNote]:
+    """List local literature notes."""
+
+    query = "SELECT * FROM literature_notes"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if topic_id is not None:
+        clauses.append("topic_id = ?")
+        params.append(topic_id)
+    if paper_id is not None:
+        clauses.append("paper_id = ?")
+        params.append(paper_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id"
+    return [_row_to_literature_note(row) for row in connection.execute(query, params).fetchall()]
+
+
+def insert_literature_summary(connection: sqlite3.Connection, summary: LiteratureSummary) -> int:
+    """Insert a deterministic topic-specific literature summary and return its id."""
+
+    connection.execute(
+        """
+        INSERT INTO literature_summaries (
+            topic_id, note_id, paper_id, summary_json, markdown_summary
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            summary.topic_id,
+            summary.note_id,
+            summary.paper_id,
+            _json_dumps(summary.summary_json),
+            summary.markdown_summary,
+        ),
+    )
+    return _last_insert_id(connection)
+
+
+def list_literature_summaries(
+    connection: sqlite3.Connection,
+    topic_id: int | None = None,
+    paper_id: int | None = None,
+) -> list[LiteratureSummary]:
+    """List deterministic topic-specific literature summaries."""
+
+    query = "SELECT * FROM literature_summaries"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if topic_id is not None:
+        clauses.append("topic_id = ?")
+        params.append(topic_id)
+    if paper_id is not None:
+        clauses.append("paper_id = ?")
+        params.append(paper_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id"
+    return [_row_to_literature_summary(row) for row in connection.execute(query, params).fetchall()]
 
 
 def insert_model(connection: sqlite3.Connection, model: Model) -> int:
@@ -1325,6 +1544,43 @@ def _row_to_paper(row: sqlite3.Row) -> Paper:
     )
 
 
+def _row_to_research_topic(row: sqlite3.Row) -> ResearchTopic:
+    return ResearchTopic(
+        id=row["id"],
+        title=row["title"],
+        raw_topic=row["raw_topic"],
+        clarified_topic=row["clarified_topic"],
+        clarification_json=_json_loads(row["clarification_json"], {}),
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_literature_note(row: sqlite3.Row) -> LiteratureNote:
+    return LiteratureNote(
+        id=row["id"],
+        topic_id=row["topic_id"],
+        paper_id=row["paper_id"],
+        source_path=row["source_path"],
+        note_type=row["note_type"],
+        title=row["title"],
+        content_json=_json_loads(row["content_json"], {}),
+        markdown_note=row["markdown_note"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_literature_summary(row: sqlite3.Row) -> LiteratureSummary:
+    return LiteratureSummary(
+        id=row["id"],
+        topic_id=row["topic_id"],
+        note_id=row["note_id"],
+        paper_id=row["paper_id"],
+        summary_json=_json_loads(row["summary_json"], {}),
+        markdown_summary=row["markdown_summary"],
+        created_at=row["created_at"],
+    )
+
+
 def _row_to_theorem(connection: sqlite3.Connection, row: sqlite3.Row) -> Theorem:
     pk = _pk_column(connection, "theorems", "theorem_id")
     return Theorem(
@@ -1494,3 +1750,7 @@ def _row_to_experiment_run(row: sqlite3.Row) -> ExperimentRun:
         git_commit_hash=row["git_commit_hash"],
         notes=row["notes"],
     )
+
+
+def _normalize_title(title: str) -> str:
+    return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in title).split())
