@@ -21,3 +21,4 @@ results/curation/*
 !generated/games/.gitkeep
 !generated/counterexamples/.gitkeep
 !results/.gitkeep
+.venv/
