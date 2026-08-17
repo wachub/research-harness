@@ -28,7 +28,9 @@ from .literature import (
     run_research_demo,
     write_research_memo,
 )
+from .llm import LLMError
 from .orchestrator import run_pipeline
+from .research_planning import plan_research, save_plan_as_pending
 from .schemas import Concept, ConceptLink, Conjecture, ResearchCluster
 
 
@@ -80,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     memo_parser.add_argument("--topic-id", required=True, type=int)
     memo_parser.add_argument("--question", required=True)
     memo_parser.add_argument("--output", help="Markdown memo path")
-    memo_parser.add_argument("--llm", action="store_true", help="Use OPENAI_API_KEY only to organize stored evidence")
+    memo_parser.add_argument("--llm", action="store_true", help="Use the configured LLM only to organize stored evidence")
 
     quality_parser = subparsers.add_parser(
         "quality-check-literature",
@@ -96,18 +98,41 @@ def build_parser() -> argparse.ArgumentParser:
     verification_parser.add_argument("--topic-id", required=True, type=int)
     verification_parser.add_argument("--output", help="Markdown verification task path")
 
+    plan_parser = subparsers.add_parser(
+        "plan-research",
+        help="Propose reviewable research directions from stored state; never executes them",
+    )
+    plan_parser.add_argument("--goal", required=True, help="Free-form research objective")
+    plan_parser.add_argument("--cluster-id", type=int, help="Restrict planning to an existing research cluster")
+    plan_parser.add_argument("--llm", action="store_true", help="Use the configured remote LLM provider")
+    plan_parser.add_argument(
+        "--save-pending",
+        action="store_true",
+        help="Save compatible proposed conjectures and questions to the existing pending queue",
+    )
+
     extract_parser = subparsers.add_parser("extract-from-text", help="Extract entries into pending queue")
     extract_parser.add_argument("--text", help="Text to extract from")
     extract_parser.add_argument("--file", help="Text file to extract from")
     extract_parser.add_argument("--prompt-file", help="Prompt file to prepend to the extraction text")
     extract_parser.add_argument("--paper-id", type=int, help="Source paper id to attach to extracted candidates")
     extract_parser.add_argument("--output-json", help="Write extraction metadata to this JSON path")
+    extract_parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="Use the explicitly configured remote LLM provider; otherwise use deterministic extraction",
+    )
 
     pdf_extract_parser = subparsers.add_parser("extract-from-pdf", help="Extract entries from a local PDF into pending queue")
     pdf_extract_parser.add_argument("--paper-id", type=int, required=True)
     pdf_extract_parser.add_argument("--pdf", required=True)
     pdf_extract_parser.add_argument("--prompt-file")
     pdf_extract_parser.add_argument("--output-json")
+    pdf_extract_parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="Use the explicitly configured remote LLM provider; otherwise use deterministic extraction",
+    )
 
     pending_parser = subparsers.add_parser("list-pending", help="List pending entries")
     pending_parser.add_argument("--status", default="pending", help="pending, flagged, approved, rejected, or all")
@@ -403,29 +428,65 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "plan-research":
+        try:
+            result = plan_research(
+                args.goal,
+                cluster_id=args.cluster_id,
+                use_llm=args.llm,
+                db_path=args.db,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if not result.available or result.plan is None:
+            print(result.message)
+            return 2
+        payload = result.plan.model_dump()
+        payload["provider"] = result.provider_metadata
+        payload["message"] = result.message
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        if args.save_pending:
+            pending_ids = save_plan_as_pending(result, args.goal, db_path=args.db)
+            print(f"Saved pending proposals: {', '.join(str(entry_id) for entry_id in pending_ids) or 'none'}")
+        return 0
+
     if args.command == "extract-from-text":
         text = _with_prompt(_read_text_arg(args.text, args.file), args.prompt_file)
-        client = LLMClient()
-        entry_ids = extract_from_text(text, db_path=args.db, client=client)
+        client = LLMClient(use_configured_provider=args.llm)
+        try:
+            entry_ids = extract_from_text(text, db_path=args.db, client=client)
+        except LLMError:
+            print("LLM extraction failed validation; no entries were written.")
+            return 2
         if args.paper_id:
             _annotate_pending_paper(args.db, entry_ids, args.paper_id)
         if args.output_json:
-            _write_json(Path(args.output_json), {"pending_entry_ids": entry_ids, "paper_id": args.paper_id})
-        mode = "dry-run" if client.dry_run else "provider"
+            payload = {"pending_entry_ids": entry_ids, "paper_id": args.paper_id}
+            if args.llm:
+                payload["llm"] = client.metadata
+            _write_json(Path(args.output_json), payload)
+        mode = "provider" if client.used_remote else "dry-run"
         print(f"Inserted pending entries ({mode}): {', '.join(str(entry_id) for entry_id in entry_ids)}")
         return 0
 
     if args.command == "extract-from-pdf":
         text = _with_prompt(_read_pdfish_text(Path(args.pdf)), args.prompt_file)
-        client = LLMClient()
-        entry_ids = extract_from_text(text, db_path=args.db, client=client)
+        client = LLMClient(use_configured_provider=args.llm)
+        try:
+            entry_ids = extract_from_text(text, db_path=args.db, client=client)
+        except LLMError:
+            print("LLM extraction failed validation; no entries were written.")
+            return 2
         _annotate_pending_paper(args.db, entry_ids, args.paper_id)
         if args.output_json:
+            payload = {"pending_entry_ids": entry_ids, "paper_id": args.paper_id, "pdf": args.pdf}
+            if args.llm:
+                payload["llm"] = client.metadata
             _write_json(
                 Path(args.output_json),
-                {"pending_entry_ids": entry_ids, "paper_id": args.paper_id, "pdf": args.pdf},
+                payload,
             )
-        mode = "dry-run" if client.dry_run else "provider"
+        mode = "provider" if client.used_remote else "dry-run"
         print(f"Inserted pending entries from PDF ({mode}): {', '.join(str(entry_id) for entry_id in entry_ids)}")
         return 0
 

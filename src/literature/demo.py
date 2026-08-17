@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from .. import db
+from ..llm import LLMClient, LLMError, LLMMessage, LLMRequest
 from ..schemas import EvidenceSpan, LiteratureNote, LiteratureSummary, Paper, ResearchCluster, ResearchTopic
 
 
@@ -105,6 +106,14 @@ class VerificationTasksResult:
     topic_id: int
     tasks_path: Path
     task_count: int
+
+
+class MemoOrganization(BaseModel):
+    """The constrained JSON shape accepted from an LLM memo organizer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memo: str = Field(min_length=1)
 
 
 def run_research_demo(
@@ -280,7 +289,7 @@ def write_research_memo(
     evidence_records = _memo_evidence_records(summaries, evidence_by_note, papers)
     memo = _build_research_memo(topic, question, evidence_records)
     used_llm = False
-    if use_llm and os.getenv("OPENAI_API_KEY"):
+    if use_llm:
         organized = _organize_memo_with_llm(question, memo, evidence_records)
         if organized:
             memo = organized
@@ -702,41 +711,67 @@ def _organize_memo_with_llm(
     deterministic_memo: str,
     evidence_records: list[dict[str, Any]],
 ) -> str | None:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    client = LLMClient()
+    if not client.available:
         return None
     prompt = {
         "instruction": (
             "Reorganize the provided research memo for clarity. Use only the memo and evidence records. "
-            "Do not add facts. Keep unsupported points labelled 'needs verification' and keep any conjecture labelled 'conjecture'."
+            "Do not add facts, citations, or evidence. Keep unsupported points labelled 'needs verification' "
+            "and keep any conjecture labelled 'conjecture'. Return JSON with exactly one key: memo."
         ),
         "question": question,
         "memo": deterministic_memo,
         "evidence_records": evidence_records,
     }
-    payload = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": "You organize stored-evidence research memos without inventing facts."},
-            {"role": "user", "content": json.dumps(prompt, sort_keys=True)},
-        ],
-    }
-    request = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except Exception:
+        organization = client.complete_json(
+            LLMRequest(
+                messages=(
+                    LLMMessage(
+                        role="system",
+                        content="You organize stored-evidence research memos without inventing facts or citations.",
+                    ),
+                    LLMMessage(role="user", content=json.dumps(prompt, sort_keys=True)),
+                ),
+                temperature=0.0,
+                json_mode=True,
+            ),
+            MemoOrganization,
+        )
+    except LLMError:
         return None
-    content = result.get("choices", [{}])[0].get("message", {}).get("content")
-    if not isinstance(content, str) or "Known Results" not in content or "Conjecture" not in content:
+    content = organization.memo
+    if "Known Results" not in content or "Conjecture" not in content:
+        return None
+    if not _uses_only_stored_citations(content, evidence_records):
         return None
     return content if content.endswith("\n") else content + "\n"
+
+
+def _uses_only_stored_citations(content: str, evidence_records: list[dict[str, Any]]) -> bool:
+    """Reject organizer output that cites evidence or local artifacts it was not given."""
+
+    known_evidence_ids = {
+        str(item["evidence_id"])
+        for record in evidence_records
+        for item in record["evidence"]
+        if item.get("evidence_id") is not None
+    }
+    cited_evidence_ids = set(re.findall(r"\bevidence(?:_id=|\s+)(\d+)\b", content, flags=re.IGNORECASE))
+    if known_evidence_ids and not cited_evidence_ids:
+        return False
+    if not cited_evidence_ids.issubset(known_evidence_ids):
+        return False
+
+    known_paths = {
+        str(item["source_path"])
+        for record in evidence_records
+        for item in record["evidence"]
+        if item.get("source_path")
+    }
+    cited_paths = set(re.findall(r"results/approved/[A-Za-z0-9_.-]+\.json", content))
+    return cited_paths.issubset(known_paths)
 
 
 def _load_literature_context(topic_id: int, db_path: str | Path | None) -> dict[str, Any]:

@@ -114,6 +114,25 @@ def test_cli_research_demo_smoke(tmp_path, capsys):
     assert report_path.exists()
 
 
+def test_research_memo_llm_option_falls_back_without_provider(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    db_path = tmp_path / "research.db"
+    result = run_research_demo(dry_run=True, db_path=db_path, output_path=tmp_path / "map.md")
+    memo_path = tmp_path / "memo.md"
+
+    memo = write_research_memo(
+        result.topic_id,
+        "What is known?",
+        db_path=db_path,
+        output_path=memo_path,
+        use_llm=True,
+    )
+
+    assert not memo.used_llm
+    assert "# Research Memo" in memo_path.read_text(encoding="utf-8")
+
+
 def test_research_memo_creates_markdown_with_required_sections(tmp_path):
     db_path = tmp_path / "research.db"
     result = run_research_demo(dry_run=True, db_path=db_path, output_path=tmp_path / "map.md")

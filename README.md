@@ -34,9 +34,14 @@ The LLM settings are:
 LLM_PROVIDER=placeholder
 LLM_API_KEY=
 LLM_MODEL=placeholder-model
+LLM_BASE_URL=https://api.openai.com/v1
 ```
 
-If `LLM_API_KEY` is empty, extraction runs in dry-run mode. The API key is never printed.
+The default `LLM_PROVIDER=placeholder` keeps extraction deterministic and offline. To opt into
+an OpenAI-compatible provider, set `LLM_PROVIDER=openai` (or `openai-compatible`), provide
+`LLM_API_KEY`, select `LLM_MODEL`, and use `--llm` with extraction. Set `LLM_BASE_URL` to an
+OpenAI-compatible `/v1` endpoint for DeepSeek or another compatible service. API keys are never
+printed or written to the database.
 
 ## Initialize The Database
 
@@ -77,6 +82,22 @@ python -m src.cli link-concepts --source 1 --target 2 --relation related_to
 
 Seed clusters include restricted multi-decision-maker synthesis, two-process distributed reachability, logical/automata characterizations of distributed strategies, Petri/control games, asynchronous automata and trace theory, and imperfect-information games.
 
+## Research Planning
+
+Use a configured LLM to turn a free-form objective into a small, reviewable plan grounded in the stored research state:
+
+```powershell
+python -m src.cli plan-research --goal "Investigate whether finite-memory strategies suffice for global safety in three-process ATS games." --cluster-id 1 --llm
+```
+
+The command only displays proposed subquestions, conjectures, literature tasks, and bounded experiment designs. It does not create clusters, approve claims, or run experiments. To place compatible proposed conjectures and questions in the existing manual-review queue, add `--save-pending`:
+
+```powershell
+python -m src.cli plan-research --goal "Investigate whether finite-memory strategies suffice for global safety in three-process ATS games." --cluster-id 1 --llm --save-pending
+```
+
+Without `--llm` and a configured remote provider, the command writes nothing and reports that planning is unavailable.
+
 ## Extraction And Curation
 
 Paste text through stdin:
@@ -89,6 +110,9 @@ Or read from a file:
 
 ```powershell
 python -m src.cli extract-from-text --file notes/example.txt
+
+# Opt in to the configured OpenAI-compatible provider.
+python -m src.cli extract-from-text --file notes/example.txt --llm
 ```
 
 Review candidates:
@@ -112,6 +136,7 @@ Run the local vertical-slice literature workflow from approved seed artifacts:
 python -m src.cli research-demo --dry-run
 python -m src.cli query-literature --topic-id 1 --question "What is known about global safety in CDM or ATS games?"
 python -m src.cli research-memo --topic-id 1 --question "Does causal ordering in two-decision-maker ATS/CDM games plausibly recover decidability for distributed safety synthesis?"
+python -m src.cli research-memo --topic-id 1 --question "Does causal ordering in two-decision-maker ATS/CDM games plausibly recover decidability for distributed safety synthesis?" --llm
 python -m src.cli quality-check-literature --topic-id 1
 python -m src.cli generate-verification-tasks --topic-id 1
 ```

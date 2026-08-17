@@ -3,20 +3,17 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal
 
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - dependency is declared in requirements.
-    def load_dotenv() -> bool:
-        return False
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import db
-from .schemas import PendingEntry
+from .llm import LLMClient as ProviderLLMClient
+from .llm import LLMError, LLMMessage, LLMRequest
+from .schemas import PendingEntry, SCHEMA_BY_ENTRY_TYPE
 
 
 EXTRACTION_INSTRUCTIONS = """
@@ -34,11 +31,53 @@ only to pending_entries for human curation.
 """.strip()
 
 
-class LLMProvider(Protocol):
-    """Provider interface for replaceable LLM backends."""
+STRUCTURED_EXTRACTION_INSTRUCTIONS = f"""
+{EXTRACTION_INSTRUCTIONS}
 
-    def extract_candidates(self, text: str, instructions: str) -> list[dict[str, Any]]:
-        """Return candidate entries with entry_type and payload fields."""
+Return one JSON object with a `candidates` array. Each candidate must contain
+`entry_type`, `payload`, and optionally `warnings`. For `concept`, `model`,
+`theorem`, `reduction`, `open_problem`, and `conjecture_seed`, make `payload`
+conform to the corresponding existing typed research object. Do not declare a
+claim approved or verified. Preserve uncertainty and source-location gaps in
+warnings instead of inventing details.
+""".strip()
+
+
+class StructuredCandidate(BaseModel):
+    """The provider's validated candidate envelope before pending storage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_type: Literal[
+        "paper_summary",
+        "concept",
+        "model",
+        "theorem",
+        "reduction",
+        "open_problem",
+        "conjecture_seed",
+    ]
+    payload: dict[str, Any]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class StructuredExtraction(BaseModel):
+    """Required top-level shape for a remote structured extraction response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[StructuredCandidate] = Field(min_length=1)
+
+
+class PaperSummaryPayload(BaseModel):
+    """Validated shape for the existing non-approvable paper-summary queue item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1)
+    model_families: list[str] = Field(default_factory=list)
+    objectives: list[str] = Field(default_factory=list)
+    notes: str | None = None
 
 
 @dataclass
@@ -66,18 +105,84 @@ class PlaceholderProvider:
 
 
 class LLMClient:
-    """Small facade that reads LLM configuration from environment variables."""
+    """Extraction facade with deterministic fallback and an opt-in remote provider.
 
-    def __init__(self, provider: LLMProvider | None = None) -> None:
-        load_dotenv()
-        self.provider_name = os.getenv("LLM_PROVIDER", "placeholder")
-        self.model = os.getenv("LLM_MODEL", "placeholder-model")
-        self._api_key_present = bool(os.getenv("LLM_API_KEY"))
-        self.dry_run = not self._api_key_present
-        self.provider = provider or PlaceholderProvider(model=self.model, dry_run=self.dry_run)
+    The generic provider implementation lives in :mod:`src.llm`. This small
+    adapter preserves the original extraction API and keeps the placeholder
+    provider as the default path.
+    """
+
+    def __init__(self, provider: Any | None = None, use_configured_provider: bool = False) -> None:
+        remote_provider = provider if provider is not None and not hasattr(provider, "extract_candidates") else None
+        self._provider_client = (
+            ProviderLLMClient(provider=remote_provider)
+            if use_configured_provider
+            else None
+        )
+        configuration = (
+            self._provider_client.configuration
+            if self._provider_client is not None
+            else ProviderLLMClient().configuration
+        )
+        self.provider_name = configuration.provider
+        self.model = configuration.model
+        self.provider = (
+            provider
+            if provider is not None and hasattr(provider, "extract_candidates")
+            else PlaceholderProvider(model=self.model, dry_run=True)
+        )
+        self.dry_run = not bool(self._provider_client and self._provider_client.available)
+        self.used_remote = False
+        self.used_fallback = False
+        self.last_error: str | None = None
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """Safe provider metadata for callers that choose to record diagnostics."""
+
+        if self._provider_client is not None:
+            return self._provider_client.metadata()
+        return {
+            "provider": self.provider_name,
+            "model": self.model,
+            "usage": {},
+            "remote_available": False,
+        }
 
     def extract_json(self, text: str) -> str:
         """Return extracted candidates as formatted JSON."""
+
+        self.used_remote = False
+        self.used_fallback = False
+        self.last_error = None
+        if self._provider_client is not None and self._provider_client.available:
+            try:
+                extraction = self._provider_client.complete_json(
+                    LLMRequest(
+                        messages=(
+                            LLMMessage(
+                                role="system",
+                                content="You extract research candidates into a manual-review queue.",
+                            ),
+                            LLMMessage(
+                                role="user",
+                                content=f"{STRUCTURED_EXTRACTION_INSTRUCTIONS}\n\n--- SOURCE TEXT ---\n{text}",
+                            ),
+                        ),
+                        temperature=0.0,
+                        json_mode=True,
+                    ),
+                    StructuredExtraction,
+                )
+                self.used_remote = True
+                return json.dumps(
+                    [candidate.model_dump() for candidate in extraction.candidates],
+                    indent=2,
+                    sort_keys=True,
+                )
+            except LLMError as exc:
+                self.last_error = str(exc)
+                self.used_fallback = True
 
         candidates = self.provider.extract_candidates(text, EXTRACTION_INSTRUCTIONS)
         return json.dumps(candidates, indent=2, sort_keys=True)
@@ -88,18 +193,40 @@ class LLMClient:
         raw_candidates = json.loads(self.extract_json(text))
         entries: list[PendingEntry] = []
         for candidate in raw_candidates:
-            warnings = list(candidate.get("warnings", []))
+            if self.used_remote:
+                try:
+                    structured = StructuredCandidate.model_validate(candidate)
+                    payload = _validate_remote_payload(structured.entry_type, structured.payload)
+                except ValidationError as exc:
+                    raise LLMError(f"LLM extraction candidate failed validation: {exc}") from exc
+                warnings = list(structured.warnings)
+                entry_type = structured.entry_type
+            else:
+                warnings = list(candidate.get("warnings", []))
+                payload = candidate.get("payload", {})
+                entry_type = candidate.get("entry_type")
             if self.dry_run and "dry-run extraction" not in warnings:
                 warnings.append("dry-run extraction")
+            if self.used_fallback and "LLM provider fallback; deterministic extraction used" not in warnings:
+                warnings.append("LLM provider fallback; deterministic extraction used")
             entries.append(
                 PendingEntry(
-                    entry_type=candidate.get("entry_type"),
-                    payload=candidate.get("payload", {}),
+                    entry_type=entry_type,
+                    payload=payload,
                     source_text=text,
                     warnings=warnings,
                 )
             )
         return entries
+
+
+def _validate_remote_payload(entry_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate remote payloads before they can enter ``pending_entries``."""
+
+    if entry_type == "paper_summary":
+        return PaperSummaryPayload.model_validate(payload).model_dump()
+    schema = SCHEMA_BY_ENTRY_TYPE[entry_type]
+    return schema.model_validate(payload).model_dump()
 
 
 def extract_from_text(
