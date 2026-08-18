@@ -16,7 +16,7 @@ from .code_artifacts import (
 )
 from .curate import approve_pending, curate_pending, flag_pending, reject_pending
 from .experiment_manager import run_experiment
-from .extract import LLMClient, extract_from_text
+from .extract import LLMClient as ExtractionLLMClient, extract_from_text
 from .experiments.ats_brute_solver import find_memoryless_safety_strategy
 from .experiments.ats_generator import generate_tiny_game
 from .experiments.ats_models import SafetyGame
@@ -28,9 +28,12 @@ from .literature import (
     run_research_demo,
     write_research_memo,
 )
+from .llm import LLMClient as ProviderLLMClient
 from .llm import LLMError
 from .orchestrator import run_pipeline
+from .research_controller import ResearchController
 from .research_planning import plan_research, save_plan_as_pending
+from .research_policy import ControllerMode
 from .schemas import Concept, ConceptLink, Conjecture, ResearchCluster
 
 
@@ -110,6 +113,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Save compatible proposed conjectures and questions to the existing pending queue",
     )
+
+    controller_parser = subparsers.add_parser(
+        "research-loop",
+        help="Run a bounded, policy-governed research controller over one cluster",
+    )
+    controller_parser.add_argument("--goal", required=True, help="High-level research objective")
+    controller_parser.add_argument("--cluster-id", required=True, type=int)
+    controller_parser.add_argument("--llm", action="store_true", help="Use the configured remote LLM provider")
+    controller_parser.add_argument("--mode", required=True, choices=[mode.value for mode in ControllerMode])
+    controller_parser.add_argument("--max-steps", default=10, type=int)
+    controller_parser.add_argument("--pause-every", type=int)
+    controller_parser.add_argument("--log", help="Append controller provenance to this JSONL path")
 
     extract_parser = subparsers.add_parser("extract-from-text", help="Extract entries into pending queue")
     extract_parser.add_argument("--text", help="Text to extract from")
@@ -450,9 +465,59 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Saved pending proposals: {', '.join(str(entry_id) for entry_id in pending_ids) or 'none'}")
         return 0
 
+    if args.command == "research-loop":
+        if not args.llm:
+            print("research-loop requires --llm and a configured remote LLM provider; nothing was written.")
+            return 2
+        controller = ResearchController(
+            ProviderLLMClient(),
+            db_path=args.db,
+            approval_callback=_controller_approval_prompt if args.mode == ControllerMode.INTERACTIVE.value else None,
+        )
+        try:
+            result = controller.run(
+                args.goal,
+                args.cluster_id,
+                mode=ControllerMode(args.mode),
+                max_steps=args.max_steps,
+                pause_every=args.pause_every,
+                log_path=args.log,
+            )
+        except ValueError as exc:
+            print(str(exc))
+            return 2
+        last_step = result.steps[-1] if result.steps else None
+        print(
+            json.dumps(
+                {
+                    "status": result.status,
+                    "message": result.message,
+                    "goal": result.goal,
+                    "cluster_id": result.cluster_id,
+                    "mode": result.mode,
+                    "steps_completed": result.steps_completed,
+                    "log_path": str(result.log_path) if result.log_path else None,
+                    "last_step": (
+                        {
+                            "step": last_step.step,
+                            "policy_decision": last_step.policy_decision,
+                            "action": last_step.action,
+                            "result": last_step.result,
+                            "success": last_step.success,
+                        }
+                        if last_step
+                        else None
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2 if result.status in {"unavailable", "provider_failure", "invalid_output", "action_failure"} else 0
+
     if args.command == "extract-from-text":
         text = _with_prompt(_read_text_arg(args.text, args.file), args.prompt_file)
-        client = LLMClient(use_configured_provider=args.llm)
+        client = ExtractionLLMClient(use_configured_provider=args.llm)
         try:
             entry_ids = extract_from_text(text, db_path=args.db, client=client)
         except LLMError:
@@ -471,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "extract-from-pdf":
         text = _with_prompt(_read_pdfish_text(Path(args.pdf)), args.prompt_file)
-        client = LLMClient(use_configured_provider=args.llm)
+        client = ExtractionLLMClient(use_configured_provider=args.llm)
         try:
             entry_ids = extract_from_text(text, db_path=args.db, client=client)
         except LLMError:
@@ -971,6 +1036,24 @@ def _configure_output_encoding() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _controller_approval_prompt(action) -> str:
+    """Small interactive boundary for controller actions that require approval."""
+
+    print("Proposed action:")
+    print(f"{action.action_type}: {json.dumps(action.parameters.model_dump(), sort_keys=True)}")
+    print(f"Why: {action.reason}")
+    print(f"Expected effect: {action.expected_effect}")
+    try:
+        answer = input("Approve? [y/N] (s=stop): ").strip().lower()
+    except EOFError:
+        return "reject"
+    if answer in {"y", "yes", "approve"}:
+        return "approve"
+    if answer in {"s", "stop"}:
+        return "stop"
+    return "reject"
 
 
 if __name__ == "__main__":

@@ -43,6 +43,22 @@ an OpenAI-compatible provider, set `LLM_PROVIDER=openai` (or `openai-compatible`
 OpenAI-compatible `/v1` endpoint for DeepSeek or another compatible service. API keys are never
 printed or written to the database.
 
+## Local Dashboard
+
+Install the project dependencies, initialize or migrate the database, then start the local
+human-facing dashboard:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m src.cli init-db
+streamlit run src/gui/app.py
+```
+
+The Streamlit dashboard provides a global state overview, project detail and timeline views,
+a read-only database explorer, the existing pending-review actions, experiment inspection, and
+safe system/LLM status. It does not expose API keys, run commands, approve claims outside the
+existing curation workflow, or treat experiments as proofs.
+
 ## Initialize The Database
 
 ```powershell
@@ -97,6 +113,33 @@ python -m src.cli plan-research --goal "Investigate whether finite-memory strate
 ```
 
 Without `--llm` and a configured remote provider, the command writes nothing and reports that planning is unavailable.
+
+## Bounded Research Controller
+
+`research-loop` is an optional operational layer over an existing cluster. It asks a configured
+LLM for exactly one typed next action per step, validates the action and its referenced IDs,
+applies an explicit authority policy, and stops after a bounded number of steps. It is not a
+background process and never approves research claims.
+
+```powershell
+# Interactive mode asks before each provisional write or bounded experiment.
+python -m src.cli research-loop --goal "Investigate whether finite-memory strategies suffice for global safety in three-process ATS games." --cluster-id 1 --llm --mode interactive --max-steps 10
+
+# Autonomous mode may create pending proposals and run the fixed bounded handler.
+python -m src.cli research-loop --goal "Investigate whether finite-memory strategies suffice for global safety in three-process ATS games." --cluster-id 1 --llm --mode autonomous --max-steps 10
+```
+
+Both modes inspect state and stored evidence automatically. In `interactive` mode, creating a
+pending conjecture/open problem, designing an experiment, running a bounded experiment, and
+reassessing the plan require approval. In `autonomous` mode those provisional actions may run
+automatically; approval of pending entries, theorem approval, conjecture promotion, deletion,
+arbitrary shell commands, unregistered code, and unbounded experiments are always blocked.
+
+The only controller-runnable experiment is a hard-coded, in-process tiny ATS/CDM/2DM
+bounded-safety check (2--3 processes, 2 local states, depth at most 5). It requires a registered
+`tested` checker/solver artifact for provenance, but never executes that artifact's path or
+entrypoint. Each run writes an append-only JSONL record under `results/controller/` (or `--log`)
+and experiment results remain experimental evidence, not theorem approval.
 
 ## Extraction And Curation
 

@@ -364,6 +364,19 @@ class ExperimentRun(StrictBase):
     notes: str | None = None
 
 
+class ResearchEvent(StrictBase):
+    """Append-only provenance event for a project timeline."""
+
+    event_id: int | None = None
+    cluster_id: int | None = None
+    event_type: str = Field(min_length=1)
+    object_type: str = Field(min_length=1)
+    object_id: int | None = None
+    summary: str = Field(min_length=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+
+
 class ResearchTopic(StrictBase):
     """An idea-specific literature review topic and its clarified scope."""
 

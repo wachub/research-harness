@@ -24,6 +24,7 @@ from .schemas import (
     ProofAttempt,
     Reduction,
     ResearchCluster,
+    ResearchEvent,
     ResearchTopic,
     Theorem,
 )
@@ -31,6 +32,28 @@ from .schemas import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "research.db"
+
+EXPLORABLE_TABLES: tuple[str, ...] = (
+    "research_clusters",
+    "concepts",
+    "concept_links",
+    "papers",
+    "research_topics",
+    "literature_notes",
+    "literature_summaries",
+    "models",
+    "theorems",
+    "reductions",
+    "open_problems",
+    "pending_entries",
+    "derived_results",
+    "conjectures",
+    "proof_attempts",
+    "evidence_spans",
+    "code_artifacts",
+    "experiment_runs",
+    "research_events",
+)
 
 
 SEED_CLUSTERS: tuple[ResearchCluster, ...] = (
@@ -409,6 +432,21 @@ def create_tables(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(cluster_id) REFERENCES research_clusters(cluster_id),
             FOREIGN KEY(conjecture_id) REFERENCES conjectures(conjecture_id)
         );
+
+        CREATE TABLE IF NOT EXISTS research_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cluster_id INTEGER,
+            event_type TEXT NOT NULL,
+            object_type TEXT NOT NULL,
+            object_id INTEGER,
+            summary TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(cluster_id) REFERENCES research_clusters(cluster_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_research_events_cluster_created
+            ON research_events (cluster_id, created_at, event_id);
         """
     )
     _migrate_existing_tables(connection)
@@ -596,7 +634,10 @@ def _json_dumps(value: Any) -> str:
 def _json_loads(value: str | None, default: Any) -> Any:
     if value is None:
         return default
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return default
 
 
 def _last_insert_id(connection: sqlite3.Connection) -> int:
@@ -612,14 +653,16 @@ def insert_cluster(
     """Insert a research cluster and return its id."""
 
     verb = "INSERT OR IGNORE" if ignore_existing else "INSERT"
+    created = False
     try:
-        connection.execute(
+        cursor = connection.execute(
             f"""
             {verb} INTO research_clusters (name, description, status, priority, notes)
             VALUES (?, ?, ?, ?, ?)
             """,
             (cluster.name, cluster.description, cluster.status, cluster.priority, cluster.notes),
         )
+        created = cursor.rowcount > 0
     except sqlite3.IntegrityError:
         connection.execute(
             """
@@ -636,7 +679,17 @@ def insert_cluster(
         "SELECT cluster_id FROM research_clusters WHERE name = ?",
         (cluster.name,),
     ).fetchone()
-    return int(row["cluster_id"])
+    cluster_id = int(row["cluster_id"])
+    if created:
+        _record_event(
+            connection,
+            cluster_id,
+            "cluster_created",
+            "research_cluster",
+            cluster_id,
+            f"Created research cluster: {cluster.name}",
+        )
+    return cluster_id
 
 
 def list_clusters(connection: sqlite3.Connection, status: str | None = None) -> list[ResearchCluster]:
@@ -790,7 +843,16 @@ def insert_paper(connection: sqlite3.Connection, paper: Paper) -> int:
             paper.cluster_id,
         ),
     )
-    return _last_insert_id(connection)
+    paper_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        paper.cluster_id,
+        "paper_added",
+        "paper",
+        paper_id,
+        f"Added paper: {paper.title}",
+    )
+    return paper_id
 
 
 def list_papers(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[Paper]:
@@ -966,7 +1028,9 @@ def insert_model(connection: sqlite3.Connection, model: Model) -> int:
             model.cluster_id,
         ),
     )
-    return _last_insert_id(connection)
+    model_id = _last_insert_id(connection)
+    _record_event(connection, model.cluster_id, "model_created", "model", model_id, f"Added model: {model.name}")
+    return model_id
 
 
 def list_models(connection: sqlite3.Connection) -> list[Model]:
@@ -1026,7 +1090,16 @@ def insert_theorem(connection: sqlite3.Connection, theorem: Theorem) -> int:
             _json_dumps(theorem.tags),
         ),
     )
-    return _last_insert_id(connection)
+    theorem_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        theorem.cluster_id,
+        "theorem_created",
+        "theorem",
+        theorem_id,
+        f"Added theorem: {theorem.title or theorem.statement[:80]}",
+    )
+    return theorem_id
 
 
 def list_theorems(
@@ -1080,7 +1153,16 @@ def insert_reduction(connection: sqlite3.Connection, reduction: Reduction) -> in
             reduction.notes,
         ),
     )
-    return _last_insert_id(connection)
+    reduction_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        reduction.cluster_id,
+        "reduction_created",
+        "reduction",
+        reduction_id,
+        f"Added reduction: {reduction.title}",
+    )
+    return reduction_id
 
 
 def list_reductions(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[Reduction]:
@@ -1118,7 +1200,16 @@ def insert_open_problem(connection: sqlite3.Connection, problem: OpenProblem) ->
             problem.notes,
         ),
     )
-    return _last_insert_id(connection)
+    problem_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        problem.cluster_id,
+        "open_problem_created",
+        "open_problem",
+        problem_id,
+        f"Added open problem: {problem.title}",
+    )
+    return problem_id
 
 
 def list_open_problems(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[OpenProblem]:
@@ -1150,7 +1241,17 @@ def insert_pending_entry(connection: sqlite3.Connection, entry: PendingEntry) ->
             _json_dumps(entry.warnings),
         ),
     )
-    return _last_insert_id(connection)
+    entry_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        _cluster_id_from_pending(entry),
+        "pending_created",
+        "pending_entry",
+        entry_id,
+        f"Created pending {entry.entry_type} proposal",
+        {"entry_type": entry.entry_type, "status": entry.status},
+    )
+    return entry_id
 
 
 def get_pending_entry(connection: sqlite3.Connection, entry_id: int) -> PendingEntry | None:
@@ -1185,6 +1286,9 @@ def update_pending_status(
 ) -> None:
     """Update curation status for a pending entry."""
 
+    entry = get_pending_entry(connection, entry_id)
+    if entry is None:
+        raise ValueError(f"pending entry {entry_id} does not exist")
     connection.execute(
         """
         UPDATE pending_entries
@@ -1200,6 +1304,15 @@ def update_pending_status(
             _json_dumps(list(warnings)) if warnings is not None else None,
             entry_id,
         ),
+    )
+    _record_event(
+        connection,
+        _cluster_id_from_pending(entry),
+        f"pending_{status}",
+        "pending_entry",
+        entry_id,
+        f"Marked pending {entry.entry_type} proposal as {status}",
+        {"entry_type": entry.entry_type, "duplicate_of": duplicate_of},
     )
 
 
@@ -1245,7 +1358,16 @@ def insert_derived_result(connection: sqlite3.Connection, result: DerivedResult)
             result.notes,
         ),
     )
-    return _last_insert_id(connection)
+    result_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        result.cluster_id,
+        "derived_result_created",
+        "derived_result",
+        result_id,
+        f"Added derived result: {result.title}",
+    )
+    return result_id
 
 
 def list_derived_results(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[DerivedResult]:
@@ -1292,7 +1414,16 @@ def insert_conjecture(connection: sqlite3.Connection, conjecture: Conjecture) ->
             conjecture.rationale,
         ),
     )
-    return _last_insert_id(connection)
+    conjecture_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        conjecture.cluster_id,
+        "conjecture_created",
+        "conjecture",
+        conjecture_id,
+        f"Added conjecture: {conjecture.title or conjecture.statement[:80]}",
+    )
+    return conjecture_id
 
 
 def list_conjectures(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[Conjecture]:
@@ -1315,8 +1446,20 @@ def get_conjecture(connection: sqlite3.Connection, conjecture_id: int) -> Conjec
 
 
 def update_conjecture_status(connection: sqlite3.Connection, conjecture_id: int, status: str) -> None:
+    conjecture = get_conjecture(connection, conjecture_id)
+    if conjecture is None:
+        raise ValueError(f"conjecture {conjecture_id} does not exist")
     pk = _pk_column(connection, "conjectures", "conjecture_id")
     connection.execute(f"UPDATE conjectures SET status = ? WHERE {pk} = ?", (status, conjecture_id))
+    _record_event(
+        connection,
+        conjecture.cluster_id,
+        "conjecture_status_changed",
+        "conjecture",
+        conjecture_id,
+        f"Changed conjecture status to {status}: {conjecture.title or conjecture.statement[:80]}",
+        {"previous_status": conjecture.status, "status": status},
+    )
 
 
 def insert_proof_attempt(connection: sqlite3.Connection, attempt: ProofAttempt) -> int:
@@ -1336,7 +1479,16 @@ def insert_proof_attempt(connection: sqlite3.Connection, attempt: ProofAttempt) 
             attempt.cluster_id,
         ),
     )
-    return _last_insert_id(connection)
+    attempt_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        attempt.cluster_id,
+        "proof_attempt_created",
+        "proof_attempt",
+        attempt_id,
+        f"Added proof attempt for {attempt.target_type}:{attempt.target_id}",
+    )
+    return attempt_id
 
 
 def list_proof_attempts(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[ProofAttempt]:
@@ -1378,7 +1530,18 @@ def insert_evidence_span(connection: sqlite3.Connection, evidence: EvidenceSpan)
             evidence.notes,
         ),
     )
-    return _last_insert_id(connection)
+    evidence_id = _last_insert_id(connection)
+    paper = get_paper(connection, evidence.paper_id)
+    _record_event(
+        connection,
+        paper.cluster_id if paper else None,
+        "evidence_added",
+        "evidence_span",
+        evidence_id,
+        f"Added evidence span for paper {evidence.paper_id}",
+        {"paper_id": evidence.paper_id, "entry_type": evidence.entry_type, "entry_id": evidence.entry_id},
+    )
+    return evidence_id
 
 
 def list_evidence_spans(connection: sqlite3.Connection, entry_type: str | None = None, entry_id: int | None = None) -> list[EvidenceSpan]:
@@ -1424,7 +1587,17 @@ def insert_code_artifact(connection: sqlite3.Connection, artifact: CodeArtifact)
             artifact.notes,
         ),
     )
-    return _last_insert_id(connection)
+    artifact_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        artifact.cluster_id,
+        "code_artifact_registered",
+        "code_artifact",
+        artifact_id,
+        f"Registered code artifact: {artifact.name}",
+        {"artifact_type": artifact.artifact_type, "status": artifact.status},
+    )
+    return artifact_id
 
 
 def list_code_artifacts(
@@ -1496,7 +1669,17 @@ def insert_experiment_run(connection: sqlite3.Connection, run: ExperimentRun) ->
             run.notes,
         ),
     )
-    return _last_insert_id(connection)
+    run_id = _last_insert_id(connection)
+    _record_event(
+        connection,
+        run.cluster_id,
+        "experiment_completed",
+        "experiment_run",
+        run_id,
+        f"Recorded experiment: {run.experiment_type}",
+        {"artifact_id": run.artifact_id, "conjecture_id": run.conjecture_id, "result_summary": run.result_summary},
+    )
+    return run_id
 
 
 def list_experiment_runs(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[ExperimentRun]:
@@ -1519,6 +1702,188 @@ def get_experiment_run(connection: sqlite3.Connection, run_id: int) -> Experimen
     return _row_to_experiment_run(row) if row else None
 
 
+def insert_research_event(connection: sqlite3.Connection, event: ResearchEvent) -> int:
+    """Append one project-history event without modifying the referenced object."""
+
+    connection.execute(
+        """
+        INSERT INTO research_events
+            (cluster_id, event_type, object_type, object_id, summary, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.cluster_id,
+            event.event_type,
+            event.object_type,
+            event.object_id,
+            event.summary,
+            _json_dumps(event.metadata),
+        ),
+    )
+    return _last_insert_id(connection)
+
+
+def list_research_events(
+    connection: sqlite3.Connection,
+    cluster_id: int | None = None,
+    limit: int | None = None,
+) -> list[ResearchEvent]:
+    """List append-only timeline events in chronological order."""
+
+    query = "SELECT * FROM research_events"
+    params: list[Any] = []
+    if cluster_id is not None:
+        query += " WHERE cluster_id = ?"
+        params.append(cluster_id)
+    query += " ORDER BY created_at, event_id"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    return [_row_to_research_event(row) for row in connection.execute(query, params).fetchall()]
+
+
+def list_explorer_records(
+    connection: sqlite3.Connection,
+    table_name: str,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Return safely decoded rows for one allow-listed table; never run user SQL."""
+
+    if table_name not in EXPLORABLE_TABLES:
+        raise ValueError(f"unsupported table: {table_name}")
+    if limit < 1 or limit > 5_000:
+        raise ValueError("limit must be between 1 and 5000")
+    rows = connection.execute(f"SELECT * FROM {table_name} ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+    return [_decode_explorer_row(row) for row in rows]
+
+
+def list_project_timeline(connection: sqlite3.Connection, cluster_id: int) -> list[dict[str, Any]]:
+    """Merge append-only events with timestamped records created before event logging."""
+
+    events = [
+        {
+            "timestamp": event.created_at,
+            "event_type": event.event_type,
+            "object_type": event.object_type,
+            "object_id": event.object_id,
+            "summary": event.summary,
+            "metadata": event.metadata,
+            "source": "event",
+        }
+        for event in list_research_events(connection, cluster_id=cluster_id)
+    ]
+    existing = {(event["object_type"], event["object_id"]) for event in events}
+    legacy_specs = (
+        ("research_clusters", "cluster_created", "research_cluster", "cluster_id", "name", "cluster_id = ?"),
+        ("papers", "paper_added", "paper", "id", "title", "cluster_id = ?"),
+        ("theorems", "theorem_created", "theorem", "theorem_id", "title", "cluster_id = ?"),
+        ("reductions", "reduction_created", "reduction", "id", "title", "cluster_id = ?"),
+        ("open_problems", "open_problem_created", "open_problem", "id", "title", "cluster_id = ?"),
+        ("derived_results", "derived_result_created", "derived_result", "id", "title", "cluster_id = ?"),
+        ("conjectures", "conjecture_created", "conjecture", "conjecture_id", "title", "cluster_id = ?"),
+        ("proof_attempts", "proof_attempt_created", "proof_attempt", "id", "strategy", "cluster_id = ?"),
+        ("code_artifacts", "code_artifact_registered", "code_artifact", "artifact_id", "name", "cluster_id = ?"),
+        ("experiment_runs", "experiment_completed", "experiment_run", "run_id", "experiment_type", "cluster_id = ?"),
+        (
+            "evidence_spans JOIN papers ON papers.id = evidence_spans.paper_id",
+            "evidence_added",
+            "evidence_span",
+            "evidence_id",
+            "quote_or_summary",
+            "papers.cluster_id = ?",
+        ),
+    )
+    for table, event_type, object_type, id_column, summary_column, where_clause in legacy_specs:
+        timestamp_column = "evidence_spans.created_at" if table.startswith("evidence_spans ") else "created_at"
+        rows = connection.execute(
+            f"SELECT {id_column} AS object_id, {summary_column} AS summary, {timestamp_column} AS created_at FROM {table} WHERE {where_clause}",
+            (cluster_id,),
+        ).fetchall()
+        for row in rows:
+            key = (object_type, row["object_id"])
+            if key not in existing:
+                events.append(
+                    {
+                        "timestamp": row["created_at"],
+                        "event_type": event_type,
+                        "object_type": object_type,
+                        "object_id": row["object_id"],
+                        "summary": str(row["summary"] or object_type),
+                        "metadata": {},
+                        "source": "legacy",
+                    }
+                )
+    for row in list_explorer_records(connection, "pending_entries", limit=5_000):
+        payload = row.get("payload_json")
+        if not isinstance(payload, dict) or payload.get("cluster_id") != cluster_id:
+            continue
+        key = ("pending_entry", row.get("id"))
+        if key not in existing:
+            events.append(
+                {
+                    "timestamp": row.get("created_at"),
+                    "event_type": "pending_created",
+                    "object_type": "pending_entry",
+                    "object_id": row.get("id"),
+                    "summary": f"Created pending {row.get('entry_type', 'research')} proposal",
+                    "metadata": {"status": row.get("status")},
+                    "source": "legacy",
+                }
+            )
+        if row.get("reviewed_at"):
+            events.append(
+                {
+                    "timestamp": row["reviewed_at"],
+                    "event_type": f"pending_{row.get('status')}",
+                    "object_type": "pending_entry",
+                    "object_id": row.get("id"),
+                    "summary": f"Reviewed pending {row.get('entry_type', 'research')} proposal",
+                    "metadata": {"status": row.get("status")},
+                    "source": "legacy",
+                }
+            )
+    return sorted(events, key=lambda event: (event["timestamp"] or "", event["object_type"], event["object_id"] or 0))
+
+
+def _decode_explorer_row(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    for key, value in tuple(result.items()):
+        if key.endswith("_json") and isinstance(value, str):
+            result[key] = _json_loads(value, {"_malformed_json": value})
+    return result
+
+
+def _record_event(
+    connection: sqlite3.Connection,
+    cluster_id: int | None,
+    event_type: str,
+    object_type: str,
+    object_id: int | None,
+    summary: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Record concise provenance from a core write path when a cluster is known."""
+
+    if cluster_id is None:
+        return
+    insert_research_event(
+        connection,
+        ResearchEvent(
+            cluster_id=cluster_id,
+            event_type=event_type,
+            object_type=object_type,
+            object_id=object_id,
+            summary=summary,
+            metadata=metadata or {},
+        ),
+    )
+
+
+def _cluster_id_from_pending(entry: PendingEntry) -> int | None:
+    value = entry.payload.get("cluster_id")
+    return value if isinstance(value, int) and value > 0 else None
+
+
 def _row_to_concept(row: sqlite3.Row) -> Concept:
     return Concept(
         concept_id=row["concept_id"],
@@ -1527,6 +1892,19 @@ def _row_to_concept(row: sqlite3.Row) -> Concept:
         description=row["description"],
         aliases=_json_loads(row["aliases_json"], []),
         notes=row["notes"],
+    )
+
+
+def _row_to_research_event(row: sqlite3.Row) -> ResearchEvent:
+    return ResearchEvent(
+        event_id=row["event_id"],
+        cluster_id=row["cluster_id"],
+        event_type=row["event_type"],
+        object_type=row["object_type"],
+        object_id=row["object_id"],
+        summary=row["summary"],
+        metadata=_json_loads(row["metadata_json"], {}),
+        created_at=row["created_at"],
     )
 
 
