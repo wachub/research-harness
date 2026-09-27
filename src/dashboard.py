@@ -181,27 +181,27 @@ def read_experiment_output(run_id: int, db_path: str | Path | None = None, max_b
     if not isinstance(candidate, str) or not candidate:
         return "No local output file is recorded for this experiment."
     path = Path(candidate).resolve()
-    root = db.PROJECT_ROOT.resolve()
-    if root not in path.parents or not path.is_file():
-        return "Recorded output file is unavailable or outside the project workspace."
+    results_root = (db.PROJECT_ROOT / "results").resolve()
+    if results_root not in path.parents or not path.is_file():
+        return "Recorded output file is unavailable or outside the permitted results directory."
     return path.read_text(encoding="utf-8", errors="replace")[:max_bytes]
 
 
 def system_status(db_path: str | Path | None = None) -> dict[str, Any]:
     """Return safe diagnostics only; credentials and raw environment are excluded."""
 
-    path = db.resolve_db_path(db_path)
     configuration = LLMConfiguration.from_environment()
-    with db.get_connection(path) as connection:
+    with db.get_connection(db_path) as connection:
         db.create_tables(connection)
         pending_count = len(db.list_pending_entries(connection, status="pending"))
         artifacts = db.list_code_artifacts(connection)
+        database_name = connection.execute("SELECT current_database() AS name").fetchone()["name"]
     return {
         "llm_provider": configuration.provider,
         "llm_model": configuration.model,
         "remote_llm_available": configuration.remote_enabled,
-        "database_path": str(path),
-        "database_exists": path.exists(),
+        "database_engine": "postgresql",
+        "database_name": database_name,
         "git_commit": get_current_commit_hash(),
         "pending_review_items": pending_count,
         "tested_code_artifacts": sum(item.status == "tested" for item in artifacts),

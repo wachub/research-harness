@@ -220,7 +220,18 @@ class LLMClient:
     def complete(self, request: LLMRequest) -> LLMResponse:
         if self.provider is None:
             raise LLMError("No remote LLM provider is configured")
-        response = self.provider.complete(request)
+        try:
+            response = self.provider.complete(request)
+        except LLMError:
+            raise
+        except Exception as exc:
+            # Providers are an external boundary.  Normalize unexpected client
+            # failures so callers never need to handle provider-specific errors.
+            raise LLMError(f"LLM provider request failed: {type(exc).__name__}") from exc
+        if not isinstance(response, LLMResponse):
+            raise LLMError("LLM provider returned an invalid response envelope")
+        if not all(isinstance(value, str) for value in (response.content, response.provider, response.model)):
+            raise LLMError("LLM provider returned an invalid response envelope")
         self.last_response = response
         return response
 
@@ -241,7 +252,7 @@ class LLMClient:
         try:
             return response_model.model_validate(payload)
         except ValidationError as exc:
-            raise LLMError(f"LLM provider JSON failed validation: {exc}") from exc
+            raise LLMError("LLM provider JSON failed validation") from exc
 
     def metadata(self) -> dict[str, Any]:
         """Return safe response metadata suitable for CLI diagnostics."""

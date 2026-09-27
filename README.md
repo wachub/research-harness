@@ -20,6 +20,39 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
+## PostgreSQL Setup
+
+PostgreSQL is the only supported persistence backend. The application never installs or
+controls an operating-system database service during normal runtime. Provision it explicitly:
+
+```bash
+# Debian/Ubuntu only; runs with administrator privileges.
+sudo ./scripts/install_postgres_debian.sh
+```
+
+For an existing PostgreSQL server, an administrator can create the restricted application
+role and database with the supplied bootstrap script. Keep credentials only in your shell or
+secret manager; never commit them:
+
+```bash
+export POSTGRES_ADMIN_URL="postgresql://admin/postgres"
+export RESEARCH_HARNESS_DB_PASSWORD="choose-a-secret"
+python scripts/bootstrap_postgres.py
+export DATABASE_URL="postgresql://research_harness:choose-a-secret/research_harness"
+python -m src.cli init-db
+```
+
+For self-hosted development, Docker Compose provisions PostgreSQL with a persistent volume:
+
+```bash
+export POSTGRES_PASSWORD="choose-a-secret"
+docker compose up -d postgres
+export DATABASE_URL="postgresql://research_harness:choose-a-secret/research_harness"
+python -m src.cli init-db
+```
+
+Tests use isolated, automatically removed PostgreSQL schemas. Set `TEST_DATABASE_URL` to a non-production database before running them; if unset, tests use `DATABASE_URL`.
+
 ## Environment
 
 Create a `.env` file from the example:
@@ -65,7 +98,7 @@ existing curation workflow, or treat experiments as proofs.
 python -m src.cli init-db
 ```
 
-This creates or migrates `data/research.db`, then seeds broad research clusters and ontology concepts.
+This creates or migrates the configured PostgreSQL schema, then seeds broad research clusters and ontology concepts.
 
 ## Recommended Workflow
 
@@ -184,7 +217,7 @@ python -m src.cli quality-check-literature --topic-id 1
 python -m src.cli generate-verification-tasks --topic-id 1
 ```
 
-The demo creates a research topic for causally ordered two-decision-maker ATS/CDM safety synthesis, loads local approved seed JSON files from `results/approved/`, stores literature notes and summaries in SQLite, links evidence spans, and writes `results/literature/demo_literature_map.md`.
+The demo creates a research topic for causally ordered two-decision-maker ATS/CDM safety synthesis, loads local approved seed JSON files from `results/approved/`, stores literature notes and summaries in PostgreSQL, links evidence spans, and writes `results/literature/demo_literature_map.md`.
 
 `research-memo` writes `results/literature/topic_<id>_research_memo.md` from stored evidence only. New conjectures are labelled as conjectures, and unsupported points are labelled `needs verification`.
 
@@ -242,7 +275,7 @@ python -m src.cli brute-check --input data/tiny_game.json --depth 5
 
 Research claims live in the database. Code lives in Git. Experiment metadata links them.
 
-Reusable implementation code should live under `src/libraries/`, `src/experiments/`, or ordinary Git-tracked experiment scripts. SQLite stores artifact metadata, command lines, result summaries, input/output paths, and git commit hashes. It does not store source-code blobs.
+Reusable implementation code should live under `src/libraries/`, `src/experiments/`, or ordinary Git-tracked experiment scripts. PostgreSQL stores artifact metadata, command lines, result summaries, input/output paths, and git commit hashes. It does not store source-code blobs.
 
 The repository includes these long-term code and output areas:
 

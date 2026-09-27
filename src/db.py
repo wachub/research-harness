@@ -1,11 +1,23 @@
-"""SQLite persistence helpers for the research harness."""
+"""PostgreSQL persistence helpers for the research harness."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
+import hashlib
+import os
+import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
+
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - declared runtime dependency.
+    def load_dotenv() -> bool:
+        return False
 
 from .schemas import (
     CodeArtifact,
@@ -31,7 +43,44 @@ from .schemas import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "research.db"
+DEFAULT_DATABASE_URL = "postgresql:///research_harness"
+_DEFAULT_DATABASE_URL = DEFAULT_DATABASE_URL
+DatabaseError = psycopg.Error
+_TEST_SCHEMAS: set[str] = set()
+
+
+class PostgresConnection:
+    """Small compatibility wrapper around psycopg's dict-row connection.
+
+    Repository queries retain their established qmark parameter style while
+    all execution occurs through PostgreSQL.
+    """
+
+    def __init__(self, connection: psycopg.Connection, schema: str | None = None) -> None:
+        self._connection = connection
+        self.schema = schema
+
+    def __enter__(self) -> "PostgresConnection":
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool | None:
+        return self._connection.__exit__(exc_type, exc, traceback)
+
+    def execute(self, query: str, params: Any = None):
+        return self._connection.execute(_postgres_query(query), params)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+
+def _postgres_query(query: str) -> str:
+    """Translate the project qmark parameter syntax for psycopg."""
+
+    return query.replace("?", "%s")
+
 
 EXPLORABLE_TABLES: tuple[str, ...] = (
     "research_clusters",
@@ -136,21 +185,64 @@ SEED_CONCEPTS: tuple[Concept, ...] = (
 )
 
 
-def resolve_db_path(db_path: str | Path | None = None) -> Path:
-    """Return a concrete database path and ensure its parent exists."""
+def resolve_database_url(database_url: str | Path | None = None) -> str:
+    """Resolve the sole supported PostgreSQL connection URL.
 
-    path = Path(db_path) if db_path else DEFAULT_DB_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    A filesystem path is accepted only while pytest is running, where it names
+    an isolated PostgreSQL schema for compatibility with the established test
+    fixtures. No file-backed database is opened or created.
+    """
+
+    load_dotenv()
+    value = str(database_url) if database_url is not None else os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+    if value.startswith(("postgresql://", "postgres://")):
+        return value
+    if os.getenv("PYTEST_CURRENT_TEST") and "://" not in value:
+        return str(os.getenv("TEST_DATABASE_URL", os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)))
+    raise ValueError("database URL must use postgresql:// or postgres://")
 
 
-def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
-    """Open a SQLite connection with row dictionaries and foreign keys enabled."""
+def _test_schema(database_url: str | Path | None) -> str | None:
+    if database_url is None or str(database_url).startswith(("postgresql://", "postgres://")):
+        return None
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        return None
+    digest = hashlib.sha256(str(database_url).encode("utf-8")).hexdigest()[:20]
+    return f"pytest_{digest}"
 
-    connection = sqlite3.connect(resolve_db_path(db_path))
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+
+def resolve_db_path(db_path: str | Path | None = None) -> str:
+    """Compatibility alias for callers not yet renamed to ``database_url``."""
+
+    return resolve_database_url(db_path)
+
+
+def get_connection(db_path: str | Path | None = None) -> PostgresConnection:
+    """Open a PostgreSQL connection with mapping rows and a safe search path."""
+
+    schema = _test_schema(db_path)
+    connection = psycopg.connect(resolve_database_url(db_path), row_factory=dict_row)
+    if schema is not None:
+        connection.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        connection.execute(f"SET search_path TO {schema}")
+        _TEST_SCHEMAS.add(schema)
+    return PostgresConnection(connection, schema)
+
+
+def cleanup_test_schemas() -> None:
+    """Remove only test schemas generated from temporary-path fixtures."""
+
+    connection = psycopg.connect(resolve_database_url(), row_factory=dict_row, autocommit=True)
+    try:
+        rows = connection.execute(
+            "SELECT nspname FROM pg_namespace WHERE nspname LIKE \x27pytest_%\x27"
+        ).fetchall()
+        for row in rows:
+            schema = str(row["nspname"])
+            if re.fullmatch(r"pytest_[0-9a-f]{20}", schema):
+                connection.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+    finally:
+        connection.close()
 
 
 def initialize_database(db_path: str | Path | None = None) -> None:
@@ -160,13 +252,13 @@ def initialize_database(db_path: str | Path | None = None) -> None:
         create_tables(connection)
 
 
-def create_tables(connection: sqlite3.Connection) -> None:
+def create_tables(connection: PostgresConnection) -> None:
     """Create the database schema and apply lightweight additive migrations."""
 
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS research_clusters (
-            cluster_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cluster_id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
             description TEXT,
             status TEXT NOT NULL,
@@ -176,7 +268,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS concepts (
-            concept_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            concept_id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
             concept_type TEXT NOT NULL,
             description TEXT,
@@ -197,7 +289,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS papers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             title TEXT NOT NULL,
             authors_json TEXT NOT NULL,
             year INTEGER NOT NULL,
@@ -211,7 +303,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS research_topics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             title TEXT NOT NULL,
             raw_topic TEXT NOT NULL,
             clarified_topic TEXT NOT NULL,
@@ -220,7 +312,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS literature_notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             topic_id INTEGER NOT NULL,
             paper_id INTEGER,
             source_path TEXT NOT NULL,
@@ -234,7 +326,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS literature_summaries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             topic_id INTEGER NOT NULL,
             note_id INTEGER,
             paper_id INTEGER,
@@ -247,7 +339,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS models (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             name TEXT NOT NULL,
             model_type TEXT NOT NULL,
             description TEXT,
@@ -260,7 +352,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS theorems (
-            theorem_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            theorem_id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             title TEXT,
             statement TEXT NOT NULL,
             theorem_type TEXT NOT NULL,
@@ -290,7 +382,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS reductions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             title TEXT NOT NULL,
             source_problem TEXT NOT NULL,
             target_problem TEXT NOT NULL,
@@ -309,7 +401,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS open_problems (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             title TEXT NOT NULL,
             statement TEXT NOT NULL,
             context TEXT,
@@ -326,7 +418,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS pending_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             entry_type TEXT NOT NULL,
             payload_json TEXT NOT NULL,
             source_text TEXT,
@@ -338,7 +430,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS derived_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             title TEXT NOT NULL,
             statement TEXT NOT NULL,
             dependencies_json TEXT NOT NULL,
@@ -351,7 +443,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS conjectures (
-            conjecture_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conjecture_id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             title TEXT,
             statement TEXT NOT NULL,
             cluster_id INTEGER,
@@ -369,7 +461,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS proof_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             target_type TEXT NOT NULL,
             target_id INTEGER NOT NULL,
             strategy TEXT NOT NULL,
@@ -381,7 +473,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS evidence_spans (
-            evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            evidence_id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             paper_id INTEGER NOT NULL,
             entry_type TEXT NOT NULL,
             entry_id INTEGER NOT NULL,
@@ -395,7 +487,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS code_artifacts (
-            artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artifact_id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             name TEXT NOT NULL,
             path TEXT NOT NULL,
             artifact_type TEXT NOT NULL,
@@ -414,7 +506,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS experiment_runs (
-            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             artifact_id INTEGER,
             cluster_id INTEGER,
             conjecture_id INTEGER,
@@ -434,7 +526,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS research_events (
-            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             cluster_id INTEGER,
             event_type TEXT NOT NULL,
             object_type TEXT NOT NULL,
@@ -453,7 +545,7 @@ def create_tables(connection: sqlite3.Connection) -> None:
     _seed_defaults(connection)
 
 
-def _migrate_existing_tables(connection: sqlite3.Connection) -> None:
+def _migrate_existing_tables(connection: PostgresConnection) -> None:
     _add_missing_columns(
         connection,
         "papers",
@@ -597,30 +689,42 @@ def _migrate_existing_tables(connection: sqlite3.Connection) -> None:
     )
 
 
-def _add_missing_columns(connection: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+def _add_missing_columns(connection: PostgresConnection, table: str, columns: dict[str, str]) -> None:
     existing = set(_column_names(connection, table))
     for name, definition in columns.items():
         if name not in existing:
-            try:
-                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column name" not in str(exc).lower():
-                    raise
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}")
 
 
-def _column_names(connection: sqlite3.Connection, table: str) -> list[str]:
-    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
-    return [str(row["name"]) for row in rows]
+def _column_names(connection: PostgresConnection, table: str) -> list[str]:
+    rows = connection.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = %s ORDER BY ordinal_position",
+        (table,),
+    ).fetchall()
+    return [str(row["column_name"]) for row in rows]
 
 
-def _pk_column(connection: sqlite3.Connection, table: str, preferred: str = "id") -> str:
+def _pk_column(connection: PostgresConnection, table: str, preferred: str = "id") -> str:
     columns = set(_column_names(connection, table))
     if preferred in columns:
         return preferred
-    return "id"
+    if "id" in columns:
+        return "id"
+    row = connection.execute(
+        "SELECT kcu.column_name FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+        "WHERE tc.table_schema = current_schema() AND tc.table_name = %s "
+        "AND tc.constraint_type = \x27PRIMARY KEY\x27 ORDER BY kcu.ordinal_position LIMIT 1",
+        (table,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"table {table} has no primary key")
+    return str(row["column_name"])
 
 
-def _seed_defaults(connection: sqlite3.Connection) -> None:
+def _seed_defaults(connection: PostgresConnection) -> None:
     for cluster in SEED_CLUSTERS:
         insert_cluster(connection, cluster, ignore_existing=True)
     for concept in SEED_CONCEPTS:
@@ -640,30 +744,32 @@ def _json_loads(value: str | None, default: Any) -> Any:
         return default
 
 
-def _last_insert_id(connection: sqlite3.Connection) -> int:
-    row = connection.execute("SELECT last_insert_rowid() AS id").fetchone()
+def _last_insert_id(connection: PostgresConnection) -> int:
+    row = connection.execute("SELECT LASTVAL() AS id").fetchone()
     return int(row["id"])
 
 
 def insert_cluster(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     cluster: ResearchCluster,
     ignore_existing: bool = False,
 ) -> int:
     """Insert a research cluster and return its id."""
 
-    verb = "INSERT OR IGNORE" if ignore_existing else "INSERT"
-    created = False
-    try:
-        cursor = connection.execute(
-            f"""
-            {verb} INTO research_clusters (name, description, status, priority, notes)
+    existing = connection.execute(
+        "SELECT cluster_id FROM research_clusters WHERE name = ?",
+        (cluster.name,),
+    ).fetchone()
+    created = existing is None
+    if created:
+        connection.execute(
+            """
+            INSERT INTO research_clusters (name, description, status, priority, notes)
             VALUES (?, ?, ?, ?, ?)
             """,
             (cluster.name, cluster.description, cluster.status, cluster.priority, cluster.notes),
         )
-        created = cursor.rowcount > 0
-    except sqlite3.IntegrityError:
+    elif not ignore_existing:
         connection.execute(
             """
             UPDATE research_clusters
@@ -692,7 +798,7 @@ def insert_cluster(
     return cluster_id
 
 
-def list_clusters(connection: sqlite3.Connection, status: str | None = None) -> list[ResearchCluster]:
+def list_clusters(connection: PostgresConnection, status: str | None = None) -> list[ResearchCluster]:
     """List research clusters ordered by priority and name."""
 
     if status:
@@ -717,7 +823,7 @@ def list_clusters(connection: sqlite3.Connection, status: str | None = None) -> 
     ]
 
 
-def get_cluster(connection: sqlite3.Connection, cluster_id: int) -> ResearchCluster | None:
+def get_cluster(connection: PostgresConnection, cluster_id: int) -> ResearchCluster | None:
     row = connection.execute(
         "SELECT * FROM research_clusters WHERE cluster_id = ?",
         (cluster_id,),
@@ -735,18 +841,20 @@ def get_cluster(connection: sqlite3.Connection, cluster_id: int) -> ResearchClus
 
 
 def insert_concept(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     concept: Concept,
     ignore_existing: bool = False,
 ) -> int:
     """Insert an ontology concept and return its id."""
 
-    verb = "INSERT OR IGNORE" if ignore_existing else "INSERT"
-    connection.execute(
-        f"""
-        {verb} INTO concepts (name, concept_type, description, aliases_json, notes)
+    query = """
+        INSERT INTO concepts (name, concept_type, description, aliases_json, notes)
         VALUES (?, ?, ?, ?, ?)
-        """,
+    """
+    if ignore_existing:
+        query += " ON CONFLICT (name) DO NOTHING"
+    connection.execute(
+        query,
         (
             concept.name,
             concept.concept_type,
@@ -762,7 +870,7 @@ def insert_concept(
     return int(row["concept_id"])
 
 
-def list_concepts(connection: sqlite3.Connection, concept_type: str | None = None) -> list[Concept]:
+def list_concepts(connection: PostgresConnection, concept_type: str | None = None) -> list[Concept]:
     """List ontology concepts."""
 
     if concept_type:
@@ -775,12 +883,12 @@ def list_concepts(connection: sqlite3.Connection, concept_type: str | None = Non
     return [_row_to_concept(row) for row in rows]
 
 
-def get_concept(connection: sqlite3.Connection, concept_id: int) -> Concept | None:
+def get_concept(connection: PostgresConnection, concept_id: int) -> Concept | None:
     row = connection.execute("SELECT * FROM concepts WHERE concept_id = ?", (concept_id,)).fetchone()
     return _row_to_concept(row) if row else None
 
 
-def find_concept_by_name_or_alias(connection: sqlite3.Connection, name: str) -> Concept | None:
+def find_concept_by_name_or_alias(connection: PostgresConnection, name: str) -> Concept | None:
     needle = name.strip().lower()
     for concept in list_concepts(connection):
         aliases = [alias.lower() for alias in concept.aliases]
@@ -789,20 +897,22 @@ def find_concept_by_name_or_alias(connection: sqlite3.Connection, name: str) -> 
     return None
 
 
-def insert_concept_link(connection: sqlite3.Connection, link: ConceptLink) -> None:
+def insert_concept_link(connection: PostgresConnection, link: ConceptLink) -> None:
     """Insert or replace a typed concept relation."""
 
     connection.execute(
         """
-        INSERT OR REPLACE INTO concept_links
+        INSERT INTO concept_links
             (source_concept_id, target_concept_id, relation_type, notes)
         VALUES (?, ?, ?, ?)
+        ON CONFLICT (source_concept_id, target_concept_id, relation_type)
+        DO UPDATE SET notes = EXCLUDED.notes
         """,
         (link.source_concept_id, link.target_concept_id, link.relation_type, link.notes),
     )
 
 
-def list_concept_links(connection: sqlite3.Connection) -> list[ConceptLink]:
+def list_concept_links(connection: PostgresConnection) -> list[ConceptLink]:
     rows = connection.execute(
         "SELECT * FROM concept_links ORDER BY source_concept_id, target_concept_id, relation_type"
     ).fetchall()
@@ -817,7 +927,7 @@ def list_concept_links(connection: sqlite3.Connection) -> list[ConceptLink]:
     ]
 
 
-def insert_paper(connection: sqlite3.Connection, paper: Paper) -> int:
+def insert_paper(connection: PostgresConnection, paper: Paper) -> int:
     """Insert a paper and return its id."""
 
     existing = connection.execute(
@@ -855,7 +965,7 @@ def insert_paper(connection: sqlite3.Connection, paper: Paper) -> int:
     return paper_id
 
 
-def list_papers(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[Paper]:
+def list_papers(connection: PostgresConnection, cluster_id: int | None = None) -> list[Paper]:
     """List papers ordered by insertion id."""
 
     if cluster_id is None:
@@ -868,14 +978,14 @@ def list_papers(connection: sqlite3.Connection, cluster_id: int | None = None) -
     return [_row_to_paper(row) for row in rows]
 
 
-def get_paper(connection: sqlite3.Connection, paper_id: int) -> Paper | None:
+def get_paper(connection: PostgresConnection, paper_id: int) -> Paper | None:
     """Fetch one paper by id."""
 
     row = connection.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
     return _row_to_paper(row) if row else None
 
 
-def find_paper_by_normalized_title(connection: sqlite3.Connection, title: str) -> Paper | None:
+def find_paper_by_normalized_title(connection: PostgresConnection, title: str) -> Paper | None:
     """Find a paper by a conservative normalized title comparison."""
 
     needle = _normalize_title(title)
@@ -885,13 +995,13 @@ def find_paper_by_normalized_title(connection: sqlite3.Connection, title: str) -
     return None
 
 
-def update_paper_pdf_path(connection: sqlite3.Connection, paper_id: int, pdf_path: str) -> None:
+def update_paper_pdf_path(connection: PostgresConnection, paper_id: int, pdf_path: str) -> None:
     """Attach a local PDF path to an existing paper record."""
 
     connection.execute("UPDATE papers SET pdf_path = ? WHERE id = ?", (pdf_path, paper_id))
 
 
-def insert_research_topic(connection: sqlite3.Connection, topic: ResearchTopic) -> int:
+def insert_research_topic(connection: PostgresConnection, topic: ResearchTopic) -> int:
     """Insert a clarified literature review topic and return its id."""
 
     connection.execute(
@@ -909,21 +1019,21 @@ def insert_research_topic(connection: sqlite3.Connection, topic: ResearchTopic) 
     return _last_insert_id(connection)
 
 
-def get_research_topic(connection: sqlite3.Connection, topic_id: int) -> ResearchTopic | None:
+def get_research_topic(connection: PostgresConnection, topic_id: int) -> ResearchTopic | None:
     """Fetch one literature review topic."""
 
     row = connection.execute("SELECT * FROM research_topics WHERE id = ?", (topic_id,)).fetchone()
     return _row_to_research_topic(row) if row else None
 
 
-def list_research_topics(connection: sqlite3.Connection) -> list[ResearchTopic]:
+def list_research_topics(connection: PostgresConnection) -> list[ResearchTopic]:
     """List literature review topics ordered by insertion id."""
 
     rows = connection.execute("SELECT * FROM research_topics ORDER BY id").fetchall()
     return [_row_to_research_topic(row) for row in rows]
 
 
-def insert_literature_note(connection: sqlite3.Connection, note: LiteratureNote) -> int:
+def insert_literature_note(connection: PostgresConnection, note: LiteratureNote) -> int:
     """Insert a local literature note and return its id."""
 
     connection.execute(
@@ -947,7 +1057,7 @@ def insert_literature_note(connection: sqlite3.Connection, note: LiteratureNote)
 
 
 def list_literature_notes(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     topic_id: int | None = None,
     paper_id: int | None = None,
 ) -> list[LiteratureNote]:
@@ -968,7 +1078,7 @@ def list_literature_notes(
     return [_row_to_literature_note(row) for row in connection.execute(query, params).fetchall()]
 
 
-def insert_literature_summary(connection: sqlite3.Connection, summary: LiteratureSummary) -> int:
+def insert_literature_summary(connection: PostgresConnection, summary: LiteratureSummary) -> int:
     """Insert a deterministic topic-specific literature summary and return its id."""
 
     connection.execute(
@@ -990,7 +1100,7 @@ def insert_literature_summary(connection: sqlite3.Connection, summary: Literatur
 
 
 def list_literature_summaries(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     topic_id: int | None = None,
     paper_id: int | None = None,
 ) -> list[LiteratureSummary]:
@@ -1011,7 +1121,7 @@ def list_literature_summaries(
     return [_row_to_literature_summary(row) for row in connection.execute(query, params).fetchall()]
 
 
-def insert_model(connection: sqlite3.Connection, model: Model) -> int:
+def insert_model(connection: PostgresConnection, model: Model) -> int:
     """Insert a model record and return its id."""
 
     connection.execute(
@@ -1033,7 +1143,7 @@ def insert_model(connection: sqlite3.Connection, model: Model) -> int:
     return model_id
 
 
-def list_models(connection: sqlite3.Connection) -> list[Model]:
+def list_models(connection: PostgresConnection) -> list[Model]:
     rows = connection.execute("SELECT * FROM models ORDER BY id").fetchall()
     return [
         Model(
@@ -1049,7 +1159,7 @@ def list_models(connection: sqlite3.Connection) -> list[Model]:
     ]
 
 
-def insert_theorem(connection: sqlite3.Connection, theorem: Theorem) -> int:
+def insert_theorem(connection: PostgresConnection, theorem: Theorem) -> int:
     """Insert a theorem-like research result and return its id."""
 
     connection.execute(
@@ -1103,7 +1213,7 @@ def insert_theorem(connection: sqlite3.Connection, theorem: Theorem) -> int:
 
 
 def list_theorems(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     cluster_id: int | None = None,
     model_family: str | None = None,
     objective_family: str | None = None,
@@ -1126,7 +1236,7 @@ def list_theorems(
     return [_row_to_theorem(connection, row) for row in connection.execute(query, params).fetchall()]
 
 
-def insert_reduction(connection: sqlite3.Connection, reduction: Reduction) -> int:
+def insert_reduction(connection: PostgresConnection, reduction: Reduction) -> int:
     """Insert a reduction record and return its id."""
 
     connection.execute(
@@ -1165,7 +1275,7 @@ def insert_reduction(connection: sqlite3.Connection, reduction: Reduction) -> in
     return reduction_id
 
 
-def list_reductions(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[Reduction]:
+def list_reductions(connection: PostgresConnection, cluster_id: int | None = None) -> list[Reduction]:
     if cluster_id is None:
         rows = connection.execute("SELECT * FROM reductions ORDER BY id").fetchall()
     else:
@@ -1176,7 +1286,7 @@ def list_reductions(connection: sqlite3.Connection, cluster_id: int | None = Non
     return [_row_to_reduction(row) for row in rows]
 
 
-def insert_open_problem(connection: sqlite3.Connection, problem: OpenProblem) -> int:
+def insert_open_problem(connection: PostgresConnection, problem: OpenProblem) -> int:
     """Insert an open problem record and return its id."""
 
     connection.execute(
@@ -1212,7 +1322,7 @@ def insert_open_problem(connection: sqlite3.Connection, problem: OpenProblem) ->
     return problem_id
 
 
-def list_open_problems(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[OpenProblem]:
+def list_open_problems(connection: PostgresConnection, cluster_id: int | None = None) -> list[OpenProblem]:
     if cluster_id is None:
         rows = connection.execute("SELECT * FROM open_problems ORDER BY id").fetchall()
     else:
@@ -1223,7 +1333,7 @@ def list_open_problems(connection: sqlite3.Connection, cluster_id: int | None = 
     return [_row_to_open_problem(row) for row in rows]
 
 
-def insert_pending_entry(connection: sqlite3.Connection, entry: PendingEntry) -> int:
+def insert_pending_entry(connection: PostgresConnection, entry: PendingEntry) -> int:
     """Insert a pending extracted entry and return its id."""
 
     connection.execute(
@@ -1254,7 +1364,7 @@ def insert_pending_entry(connection: sqlite3.Connection, entry: PendingEntry) ->
     return entry_id
 
 
-def get_pending_entry(connection: sqlite3.Connection, entry_id: int) -> PendingEntry | None:
+def get_pending_entry(connection: PostgresConnection, entry_id: int) -> PendingEntry | None:
     """Fetch a pending entry by id."""
 
     row = connection.execute("SELECT * FROM pending_entries WHERE id = ?", (entry_id,)).fetchone()
@@ -1262,7 +1372,7 @@ def get_pending_entry(connection: sqlite3.Connection, entry_id: int) -> PendingE
 
 
 def list_pending_entries(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     status: str | None = "pending",
 ) -> list[PendingEntry]:
     """List pending entries, optionally filtered by status."""
@@ -1278,7 +1388,7 @@ def list_pending_entries(
 
 
 def update_pending_status(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     entry_id: int,
     status: str,
     duplicate_of: str | None = None,
@@ -1317,7 +1427,7 @@ def update_pending_status(
 
 
 def update_pending_payload(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     entry_id: int,
     payload: dict[str, Any],
     warnings: Iterable[str] | None = None,
@@ -1339,7 +1449,7 @@ def update_pending_payload(
     )
 
 
-def insert_derived_result(connection: sqlite3.Connection, result: DerivedResult) -> int:
+def insert_derived_result(connection: PostgresConnection, result: DerivedResult) -> int:
     """Insert a derived result and return its id."""
 
     connection.execute(
@@ -1370,7 +1480,7 @@ def insert_derived_result(connection: sqlite3.Connection, result: DerivedResult)
     return result_id
 
 
-def list_derived_results(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[DerivedResult]:
+def list_derived_results(connection: PostgresConnection, cluster_id: int | None = None) -> list[DerivedResult]:
     """List derived results ordered by insertion id."""
 
     if cluster_id is None:
@@ -1383,11 +1493,11 @@ def list_derived_results(connection: sqlite3.Connection, cluster_id: int | None 
     return [_row_to_derived_result(row) for row in rows]
 
 
-def update_derived_result_status(connection: sqlite3.Connection, result_id: int, status: str) -> None:
+def update_derived_result_status(connection: PostgresConnection, result_id: int, status: str) -> None:
     connection.execute("UPDATE derived_results SET status = ? WHERE id = ?", (status, result_id))
 
 
-def insert_conjecture(connection: sqlite3.Connection, conjecture: Conjecture) -> int:
+def insert_conjecture(connection: PostgresConnection, conjecture: Conjecture) -> int:
     """Insert a conjecture and return its id."""
 
     connection.execute(
@@ -1426,7 +1536,7 @@ def insert_conjecture(connection: sqlite3.Connection, conjecture: Conjecture) ->
     return conjecture_id
 
 
-def list_conjectures(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[Conjecture]:
+def list_conjectures(connection: PostgresConnection, cluster_id: int | None = None) -> list[Conjecture]:
     """List conjectures ordered by insertion id."""
 
     if cluster_id is None:
@@ -1439,13 +1549,13 @@ def list_conjectures(connection: sqlite3.Connection, cluster_id: int | None = No
     return [_row_to_conjecture(connection, row) for row in rows]
 
 
-def get_conjecture(connection: sqlite3.Connection, conjecture_id: int) -> Conjecture | None:
+def get_conjecture(connection: PostgresConnection, conjecture_id: int) -> Conjecture | None:
     pk = _pk_column(connection, "conjectures", "conjecture_id")
     row = connection.execute(f"SELECT * FROM conjectures WHERE {pk} = ?", (conjecture_id,)).fetchone()
     return _row_to_conjecture(connection, row) if row else None
 
 
-def update_conjecture_status(connection: sqlite3.Connection, conjecture_id: int, status: str) -> None:
+def update_conjecture_status(connection: PostgresConnection, conjecture_id: int, status: str) -> None:
     conjecture = get_conjecture(connection, conjecture_id)
     if conjecture is None:
         raise ValueError(f"conjecture {conjecture_id} does not exist")
@@ -1462,7 +1572,7 @@ def update_conjecture_status(connection: sqlite3.Connection, conjecture_id: int,
     )
 
 
-def insert_proof_attempt(connection: sqlite3.Connection, attempt: ProofAttempt) -> int:
+def insert_proof_attempt(connection: PostgresConnection, attempt: ProofAttempt) -> int:
     """Insert a proof attempt and return its id."""
 
     connection.execute(
@@ -1491,7 +1601,7 @@ def insert_proof_attempt(connection: sqlite3.Connection, attempt: ProofAttempt) 
     return attempt_id
 
 
-def list_proof_attempts(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[ProofAttempt]:
+def list_proof_attempts(connection: PostgresConnection, cluster_id: int | None = None) -> list[ProofAttempt]:
     """List proof attempts ordered by insertion id."""
 
     if cluster_id is None:
@@ -1504,11 +1614,11 @@ def list_proof_attempts(connection: sqlite3.Connection, cluster_id: int | None =
     return [_row_to_proof_attempt(row) for row in rows]
 
 
-def update_proof_attempt_status(connection: sqlite3.Connection, attempt_id: int, status: str) -> None:
+def update_proof_attempt_status(connection: PostgresConnection, attempt_id: int, status: str) -> None:
     connection.execute("UPDATE proof_attempts SET status = ? WHERE id = ?", (status, attempt_id))
 
 
-def insert_evidence_span(connection: sqlite3.Connection, evidence: EvidenceSpan) -> int:
+def insert_evidence_span(connection: PostgresConnection, evidence: EvidenceSpan) -> int:
     """Insert an evidence span and return its id."""
 
     connection.execute(
@@ -1544,7 +1654,7 @@ def insert_evidence_span(connection: sqlite3.Connection, evidence: EvidenceSpan)
     return evidence_id
 
 
-def list_evidence_spans(connection: sqlite3.Connection, entry_type: str | None = None, entry_id: int | None = None) -> list[EvidenceSpan]:
+def list_evidence_spans(connection: PostgresConnection, entry_type: str | None = None, entry_id: int | None = None) -> list[EvidenceSpan]:
     query = "SELECT * FROM evidence_spans"
     clauses: list[str] = []
     params: list[Any] = []
@@ -1560,7 +1670,7 @@ def list_evidence_spans(connection: sqlite3.Connection, entry_type: str | None =
     return [_row_to_evidence_span(row) for row in connection.execute(query, params).fetchall()]
 
 
-def insert_code_artifact(connection: sqlite3.Connection, artifact: CodeArtifact) -> int:
+def insert_code_artifact(connection: PostgresConnection, artifact: CodeArtifact) -> int:
     """Insert code-artifact metadata and return its id."""
 
     connection.execute(
@@ -1601,7 +1711,7 @@ def insert_code_artifact(connection: sqlite3.Connection, artifact: CodeArtifact)
 
 
 def list_code_artifacts(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     artifact_type: str | None = None,
     status: str | None = None,
 ) -> list[CodeArtifact]:
@@ -1622,7 +1732,7 @@ def list_code_artifacts(
     return [_row_to_code_artifact(row) for row in connection.execute(query, params).fetchall()]
 
 
-def get_code_artifact(connection: sqlite3.Connection, artifact_id: int) -> CodeArtifact | None:
+def get_code_artifact(connection: PostgresConnection, artifact_id: int) -> CodeArtifact | None:
     """Fetch one code artifact by id."""
 
     row = connection.execute(
@@ -1632,7 +1742,7 @@ def get_code_artifact(connection: sqlite3.Connection, artifact_id: int) -> CodeA
     return _row_to_code_artifact(row) if row else None
 
 
-def update_code_artifact_status(connection: sqlite3.Connection, artifact_id: int, status: str) -> None:
+def update_code_artifact_status(connection: PostgresConnection, artifact_id: int, status: str) -> None:
     """Update a code artifact status."""
 
     connection.execute(
@@ -1641,7 +1751,7 @@ def update_code_artifact_status(connection: sqlite3.Connection, artifact_id: int
     )
 
 
-def insert_experiment_run(connection: sqlite3.Connection, run: ExperimentRun) -> int:
+def insert_experiment_run(connection: PostgresConnection, run: ExperimentRun) -> int:
     """Insert a small experiment run and return its id."""
 
     connection.execute(
@@ -1682,7 +1792,7 @@ def insert_experiment_run(connection: sqlite3.Connection, run: ExperimentRun) ->
     return run_id
 
 
-def list_experiment_runs(connection: sqlite3.Connection, cluster_id: int | None = None) -> list[ExperimentRun]:
+def list_experiment_runs(connection: PostgresConnection, cluster_id: int | None = None) -> list[ExperimentRun]:
     """List stored experiment runs."""
 
     if cluster_id is None:
@@ -1695,14 +1805,14 @@ def list_experiment_runs(connection: sqlite3.Connection, cluster_id: int | None 
     return [_row_to_experiment_run(row) for row in rows]
 
 
-def get_experiment_run(connection: sqlite3.Connection, run_id: int) -> ExperimentRun | None:
+def get_experiment_run(connection: PostgresConnection, run_id: int) -> ExperimentRun | None:
     """Fetch one experiment run by id."""
 
     row = connection.execute("SELECT * FROM experiment_runs WHERE run_id = ?", (run_id,)).fetchone()
     return _row_to_experiment_run(row) if row else None
 
 
-def insert_research_event(connection: sqlite3.Connection, event: ResearchEvent) -> int:
+def insert_research_event(connection: PostgresConnection, event: ResearchEvent) -> int:
     """Append one project-history event without modifying the referenced object."""
 
     connection.execute(
@@ -1724,7 +1834,7 @@ def insert_research_event(connection: sqlite3.Connection, event: ResearchEvent) 
 
 
 def list_research_events(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     cluster_id: int | None = None,
     limit: int | None = None,
 ) -> list[ResearchEvent]:
@@ -1743,7 +1853,7 @@ def list_research_events(
 
 
 def list_explorer_records(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     table_name: str,
     limit: int = 500,
 ) -> list[dict[str, Any]]:
@@ -1753,11 +1863,11 @@ def list_explorer_records(
         raise ValueError(f"unsupported table: {table_name}")
     if limit < 1 or limit > 5_000:
         raise ValueError("limit must be between 1 and 5000")
-    rows = connection.execute(f"SELECT * FROM {table_name} ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+    rows = connection.execute(f"SELECT * FROM {table_name} ORDER BY created_at DESC, {_pk_column(connection, table_name)} DESC LIMIT ?", (limit,)).fetchall()
     return [_decode_explorer_row(row) for row in rows]
 
 
-def list_project_timeline(connection: sqlite3.Connection, cluster_id: int) -> list[dict[str, Any]]:
+def list_project_timeline(connection: PostgresConnection, cluster_id: int) -> list[dict[str, Any]]:
     """Merge append-only events with timestamped records created before event logging."""
 
     events = [
@@ -1845,7 +1955,7 @@ def list_project_timeline(connection: sqlite3.Connection, cluster_id: int) -> li
     return sorted(events, key=lambda event: (event["timestamp"] or "", event["object_type"], event["object_id"] or 0))
 
 
-def _decode_explorer_row(row: sqlite3.Row) -> dict[str, Any]:
+def _decode_explorer_row(row: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(row)
     for key, value in tuple(result.items()):
         if key.endswith("_json") and isinstance(value, str):
@@ -1854,7 +1964,7 @@ def _decode_explorer_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _record_event(
-    connection: sqlite3.Connection,
+    connection: PostgresConnection,
     cluster_id: int | None,
     event_type: str,
     object_type: str,
@@ -1884,7 +1994,7 @@ def _cluster_id_from_pending(entry: PendingEntry) -> int | None:
     return value if isinstance(value, int) and value > 0 else None
 
 
-def _row_to_concept(row: sqlite3.Row) -> Concept:
+def _row_to_concept(row: Mapping[str, Any]) -> Concept:
     return Concept(
         concept_id=row["concept_id"],
         name=row["name"],
@@ -1895,7 +2005,7 @@ def _row_to_concept(row: sqlite3.Row) -> Concept:
     )
 
 
-def _row_to_research_event(row: sqlite3.Row) -> ResearchEvent:
+def _row_to_research_event(row: Mapping[str, Any]) -> ResearchEvent:
     return ResearchEvent(
         event_id=row["event_id"],
         cluster_id=row["cluster_id"],
@@ -1908,7 +2018,7 @@ def _row_to_research_event(row: sqlite3.Row) -> ResearchEvent:
     )
 
 
-def _row_to_paper(row: sqlite3.Row) -> Paper:
+def _row_to_paper(row: Mapping[str, Any]) -> Paper:
     return Paper(
         id=row["id"],
         title=row["title"],
@@ -1922,7 +2032,7 @@ def _row_to_paper(row: sqlite3.Row) -> Paper:
     )
 
 
-def _row_to_research_topic(row: sqlite3.Row) -> ResearchTopic:
+def _row_to_research_topic(row: Mapping[str, Any]) -> ResearchTopic:
     return ResearchTopic(
         id=row["id"],
         title=row["title"],
@@ -1933,7 +2043,7 @@ def _row_to_research_topic(row: sqlite3.Row) -> ResearchTopic:
     )
 
 
-def _row_to_literature_note(row: sqlite3.Row) -> LiteratureNote:
+def _row_to_literature_note(row: Mapping[str, Any]) -> LiteratureNote:
     return LiteratureNote(
         id=row["id"],
         topic_id=row["topic_id"],
@@ -1947,7 +2057,7 @@ def _row_to_literature_note(row: sqlite3.Row) -> LiteratureNote:
     )
 
 
-def _row_to_literature_summary(row: sqlite3.Row) -> LiteratureSummary:
+def _row_to_literature_summary(row: Mapping[str, Any]) -> LiteratureSummary:
     return LiteratureSummary(
         id=row["id"],
         topic_id=row["topic_id"],
@@ -1959,7 +2069,7 @@ def _row_to_literature_summary(row: sqlite3.Row) -> LiteratureSummary:
     )
 
 
-def _row_to_theorem(connection: sqlite3.Connection, row: sqlite3.Row) -> Theorem:
+def _row_to_theorem(connection: PostgresConnection, row: Mapping[str, Any]) -> Theorem:
     pk = _pk_column(connection, "theorems", "theorem_id")
     return Theorem(
         theorem_id=row[pk],
@@ -1989,7 +2099,7 @@ def _row_to_theorem(connection: sqlite3.Connection, row: sqlite3.Row) -> Theorem
     )
 
 
-def _row_to_reduction(row: sqlite3.Row) -> Reduction:
+def _row_to_reduction(row: Mapping[str, Any]) -> Reduction:
     return Reduction(
         id=row["id"],
         title=row["title"],
@@ -2007,7 +2117,7 @@ def _row_to_reduction(row: sqlite3.Row) -> Reduction:
     )
 
 
-def _row_to_open_problem(row: sqlite3.Row) -> OpenProblem:
+def _row_to_open_problem(row: Mapping[str, Any]) -> OpenProblem:
     return OpenProblem(
         id=row["id"],
         title=row["title"],
@@ -2023,7 +2133,7 @@ def _row_to_open_problem(row: sqlite3.Row) -> OpenProblem:
     )
 
 
-def _row_to_pending_entry(row: sqlite3.Row) -> PendingEntry:
+def _row_to_pending_entry(row: Mapping[str, Any]) -> PendingEntry:
     return PendingEntry(
         id=row["id"],
         entry_type=row["entry_type"],
@@ -2035,7 +2145,7 @@ def _row_to_pending_entry(row: sqlite3.Row) -> PendingEntry:
     )
 
 
-def _row_to_derived_result(row: sqlite3.Row) -> DerivedResult:
+def _row_to_derived_result(row: Mapping[str, Any]) -> DerivedResult:
     return DerivedResult(
         id=row["id"],
         title=row["title"],
@@ -2048,7 +2158,7 @@ def _row_to_derived_result(row: sqlite3.Row) -> DerivedResult:
     )
 
 
-def _row_to_conjecture(connection: sqlite3.Connection, row: sqlite3.Row) -> Conjecture:
+def _row_to_conjecture(connection: PostgresConnection, row: Mapping[str, Any]) -> Conjecture:
     pk = _pk_column(connection, "conjectures", "conjecture_id")
     return Conjecture(
         conjecture_id=row[pk],
@@ -2067,7 +2177,7 @@ def _row_to_conjecture(connection: sqlite3.Connection, row: sqlite3.Row) -> Conj
     )
 
 
-def _row_to_proof_attempt(row: sqlite3.Row) -> ProofAttempt:
+def _row_to_proof_attempt(row: Mapping[str, Any]) -> ProofAttempt:
     return ProofAttempt(
         id=row["id"],
         target_type=row["target_type"],
@@ -2079,7 +2189,7 @@ def _row_to_proof_attempt(row: sqlite3.Row) -> ProofAttempt:
     )
 
 
-def _row_to_evidence_span(row: sqlite3.Row) -> EvidenceSpan:
+def _row_to_evidence_span(row: Mapping[str, Any]) -> EvidenceSpan:
     return EvidenceSpan(
         evidence_id=row["evidence_id"],
         paper_id=row["paper_id"],
@@ -2093,7 +2203,7 @@ def _row_to_evidence_span(row: sqlite3.Row) -> EvidenceSpan:
     )
 
 
-def _row_to_code_artifact(row: sqlite3.Row) -> CodeArtifact:
+def _row_to_code_artifact(row: Mapping[str, Any]) -> CodeArtifact:
     return CodeArtifact(
         artifact_id=row["artifact_id"],
         name=row["name"],
@@ -2112,7 +2222,7 @@ def _row_to_code_artifact(row: sqlite3.Row) -> CodeArtifact:
     )
 
 
-def _row_to_experiment_run(row: sqlite3.Row) -> ExperimentRun:
+def _row_to_experiment_run(row: Mapping[str, Any]) -> ExperimentRun:
     return ExperimentRun(
         run_id=row["run_id"],
         artifact_id=row["artifact_id"],

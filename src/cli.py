@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
             "in distributed games and automata-theoretic synthesis."
         )
     )
-    parser.add_argument("--db", default=str(db.DEFAULT_DB_PATH), help="SQLite database path")
+    parser.add_argument("--db", default=db.DEFAULT_DATABASE_URL, help="PostgreSQL database URL")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init-db", help="Create or migrate database tables")

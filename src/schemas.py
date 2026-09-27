@@ -82,7 +82,7 @@ ModelType = Literal[
 
 
 class StrictBase(BaseModel):
-    """Base schema for typed SQLite boundaries."""
+    """Base schema for typed persistence boundaries."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, populate_by_name=True)
 

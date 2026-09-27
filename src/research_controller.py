@@ -297,7 +297,12 @@ class ResearchController:
         return decision.action
 
     def _validate_action(self, action: ControllerAction, context: ControllerContext) -> None:
+        references: set[tuple[str, int]] = set()
         for reference in action.references:
+            key = (reference.kind, reference.object_id)
+            if key in references:
+                raise ValueError(f"duplicate {reference.kind} reference {reference.object_id}")
+            references.add(key)
             validate_context_reference(context, reference.kind, reference.object_id)
         if isinstance(action, ReviewStoredEvidenceAction):
             for evidence_id in action.parameters.evidence_ids:
@@ -425,17 +430,19 @@ class ResearchController:
         result: dict[str, Any],
         success: bool,
     ) -> ControllerStep:
+        action_payload = _redact_secrets(action.model_dump(), self._secret_values()) if action is not None else None
+        result_payload = _redact_secrets(result, self._secret_values())
         step = ControllerStep(
             step=step_number,
             timestamp=datetime.now(timezone.utc).isoformat(),
             policy_decision=policy_decision,
-            action=action.model_dump() if action is not None else None,
-            result=result,
+            action=action_payload,
+            result=result_payload,
             success=success,
         )
         log.append(
             {
-                "goal": goal,
+                "goal": _redact_secrets(goal, self._secret_values()),
                 "mode": mode.value,
                 "cluster_id": cluster_id,
                 "provider": self.client.metadata(),
@@ -444,6 +451,10 @@ class ResearchController:
         )
         steps.append(step)
         return step
+
+    def _secret_values(self) -> tuple[str, ...]:
+        api_key = self.client.configuration.api_key
+        return (api_key,) if api_key else ()
 
     @staticmethod
     def _finish(
@@ -474,3 +485,19 @@ def _recent_summary(step: ControllerStep) -> dict[str, Any]:
         "success": step.success,
         "result": step.result,
     }
+
+
+def _redact_secrets(value: Any, secrets: tuple[str, ...]) -> Any:
+    """Redact configured credentials from controller logs and displayed steps."""
+
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, "[REDACTED]")
+        return value
+    if isinstance(value, dict):
+        return {key: _redact_secrets(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_secrets(item, secrets) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_secrets(item, secrets) for item in value)
+    return value

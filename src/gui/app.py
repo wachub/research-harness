@@ -24,7 +24,7 @@ def main() -> None:
     st.caption("Human review and inspection panel. Pending proposals, conjectures, and experiments remain distinct.")
     with st.sidebar:
         st.header("Workspace")
-        db_path = st.text_input("Database path", value=str(db.DEFAULT_DB_PATH))
+        db_path = st.text_input("Database URL", value=db.DEFAULT_DATABASE_URL)
         page = st.radio(
             "View",
             ["Dashboard", "Projects", "Review Queue", "Database Explorer", "Experiments", "System Status"],
@@ -44,7 +44,7 @@ def main() -> None:
             _experiments_view(db_path)
         else:
             _system_status_view(db_path)
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, db.DatabaseError) as exc:
         st.error(str(exc))
 
 
@@ -150,6 +150,7 @@ def _explorer_view(db_path: str) -> None:
 
 def _experiments_view(db_path: str) -> None:
     st.header("Experiment history")
+    st.caption("Experiment runs are recorded observations, not proofs or established theorems.")
     runs = dashboard.experiment_records(db_path=db_path)
     _records(runs, "experiment_runs")
     if not runs:
