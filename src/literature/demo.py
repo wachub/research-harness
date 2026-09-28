@@ -13,11 +13,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .. import db
 from ..llm import LLMClient, LLMError, LLMMessage, LLMRequest
-from ..schemas import EvidenceSpan, LiteratureNote, LiteratureSummary, Paper, ResearchCluster, ResearchTopic
+from ..schemas import EvidenceSpan, LiteratureNote, LiteratureSummary, Paper, ResearchTask, ResearchTopic
 
 
 TARGET_TOPIC = "causally ordered two-decision-maker ATS/CDM games and decidability of distributed safety synthesis"
-TARGET_CLUSTER = "Restricted multi-decision-maker synthesis"
+TARGET_TASK = "Restricted multi-decision-maker synthesis"
 
 PAPER_SEEDS: dict[int, Paper] = {
     1: Paper(
@@ -130,9 +130,9 @@ def run_research_demo(
 
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
-        cluster_id = _ensure_cluster(connection)
+        task_id = _ensure_task(connection)
         topic_id = db.insert_research_topic(connection, _topic())
-        paper_ids = _ensure_seed_papers(connection, cluster_id)
+        paper_ids = _ensure_seed_papers(connection, task_id)
 
         evidence_count = 0
         notes_loaded = 0
@@ -383,16 +383,18 @@ def generate_verification_tasks(
     return VerificationTasksResult(topic_id=topic_id, tasks_path=tasks_path, task_count=len(tasks))
 
 
-def _ensure_cluster(connection) -> int:
-    return db.insert_cluster(
+def _ensure_task(connection) -> int:
+    existing = connection.execute(
+        "SELECT task_id FROM research_tasks WHERE name = ?", (TARGET_TASK,)
+    ).fetchone()
+    if existing is not None:
+        return int(existing["task_id"])
+    return db.insert_task(
         connection,
-        ResearchCluster(
-            name=TARGET_CLUSTER,
+        ResearchTask(
+            name=TARGET_TASK,
             description="ATS/CDM/2DM frontier for causal memory, decision-maker restrictions, and safety synthesis.",
-            status="active",
-            priority=10,
         ),
-        ignore_existing=True,
     )
 
 
@@ -414,7 +416,7 @@ def _topic() -> ResearchTopic:
     )
 
 
-def _ensure_seed_papers(connection, cluster_id: int) -> dict[int, int]:
+def _ensure_seed_papers(connection, task_id: int) -> dict[int, int]:
     paper_ids: dict[int, int] = {}
     for source_id, seed in PAPER_SEEDS.items():
         paper = Paper(
@@ -423,7 +425,7 @@ def _ensure_seed_papers(connection, cluster_id: int) -> dict[int, int]:
             year=seed.year,
             venue=seed.venue,
             url=seed.url,
-            cluster_id=cluster_id if source_id in {1, 2} else seed.cluster_id,
+            task_id=task_id if source_id in {1, 2} else seed.task_id,
             notes="Loaded by local research-demo from approved seed artifacts.",
         )
         paper_ids[source_id] = db.insert_paper(connection, paper)

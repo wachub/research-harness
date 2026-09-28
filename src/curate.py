@@ -16,6 +16,7 @@ from .schemas import (
     OpenProblem,
     PendingEntry,
     Reduction,
+    ResearchUnitLink,
     SCHEMA_BY_ENTRY_TYPE,
     Theorem,
 )
@@ -143,6 +144,22 @@ def approve_pending(entry_id: int, db_path: str | Path | None = None) -> Approva
 
         warnings, duplicates = analyze_pending_entry(connection, entry)
         inserted_table, inserted_id = _insert_validated_payload(connection, entry)
+        object_type = {
+            "concepts": "concept",
+            "models": "model",
+            "theorems": "theorem",
+            "reductions": "reduction",
+            "open_problems": "open_problem",
+            "conjectures": "conjecture",
+        }[inserted_table]
+        for source in db.list_research_units_for_object(connection, "pending_entry", entry_id):
+            db.link_research_unit(
+                connection,
+                ResearchUnitLink(
+                    unit_id=source.unit_id, relation="produces",
+                    object_type=object_type, object_id=inserted_id,
+                ),
+            )
         duplicate_of = _format_duplicate(duplicates[0]) if duplicates else None
         db.update_pending_status(
             connection,

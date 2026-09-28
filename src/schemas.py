@@ -17,7 +17,6 @@ EntryType = Literal[
     "conjecture_seed",
 ]
 PendingStatus = Literal["pending", "approved", "rejected", "flagged"]
-ClusterStatus = Literal["active", "watchlist", "archived"]
 ConceptType = Literal[
     "model",
     "objective",
@@ -87,15 +86,12 @@ class StrictBase(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, populate_by_name=True)
 
 
-class ResearchCluster(StrictBase):
-    """A literature and problem cluster within the broader research map."""
+class ResearchTask(StrictBase):
+    """A fixed research objective whose progress is recorded in research units."""
 
-    cluster_id: int | None = None
+    task_id: int | None = None
     name: str = Field(min_length=1)
     description: str | None = None
-    status: ClusterStatus = "active"
-    priority: int = 0
-    notes: str | None = None
 
 
 class Concept(StrictBase):
@@ -134,7 +130,7 @@ class Paper(StrictBase):
     pdf_path: str | None = None
     url: str | None = None
     notes: str | None = None
-    cluster_id: int | None = None
+    task_id: int | None = None
 
     @field_validator("authors")
     @classmethod
@@ -154,7 +150,7 @@ class Model(StrictBase):
     description: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     source_paper_id: int | None = None
-    cluster_id: int | None = None
+    task_id: int | None = None
 
 
 class Theorem(StrictBase):
@@ -178,7 +174,7 @@ class Theorem(StrictBase):
     source_location: str | None = None
     proof_technique: str | None = None
     confidence: Confidence = "pending"
-    cluster_id: int | None = None
+    task_id: int | None = None
     notes: str | None = None
     assumptions: list[str] = Field(default_factory=list)
     conclusion: str | None = None
@@ -213,7 +209,7 @@ class Reduction(StrictBase):
     source_paper_id: int | None = None
     source_location: str | None = None
     proof_technique: str | None = None
-    cluster_id: int | None = None
+    task_id: int | None = None
     tags: list[str] = Field(default_factory=list)
     notes: str | None = None
 
@@ -235,7 +231,7 @@ class OpenProblem(StrictBase):
     paper_id: int | None = None
     source_paper_id: int | None = None
     source_location: str | None = None
-    cluster_id: int | None = None
+    task_id: int | None = None
     tags: list[str] = Field(default_factory=list)
     notes: str | None = None
 
@@ -267,7 +263,7 @@ class DerivedResult(StrictBase):
     dependencies: list[str] = Field(default_factory=list)
     proof_sketch: str | None = None
     status: ReviewStatus = "draft"
-    cluster_id: int | None = None
+    task_id: int | None = None
     notes: str | None = None
 
 
@@ -277,7 +273,7 @@ class Conjecture(StrictBase):
     conjecture_id: int | None = Field(default=None, validation_alias=AliasChoices("conjecture_id", "id"))
     title: str | None = None
     statement: str = Field(min_length=1)
-    cluster_id: int | None = None
+    task_id: int | None = None
     motivation: str | None = None
     related_theorems: list[int] = Field(default_factory=list)
     expected_status: ConjectureExpectedStatus = "unknown"
@@ -310,7 +306,7 @@ class ProofAttempt(StrictBase):
     strategy: str = Field(min_length=1)
     notes: str | None = None
     status: ReviewStatus = "draft"
-    cluster_id: int | None = None
+    task_id: int | None = None
 
 
 class EvidenceSpan(StrictBase):
@@ -318,7 +314,7 @@ class EvidenceSpan(StrictBase):
 
     evidence_id: int | None = None
     paper_id: int
-    entry_type: Literal["theorem", "model", "reduction", "open_problem", "derived_result", "concept", "literature_note"]
+    entry_type: Literal["theorem", "model", "reduction", "open_problem", "conjecture", "derived_result", "concept", "literature_note"]
     entry_id: int
     page_start: int | None = None
     page_end: int | None = None
@@ -337,7 +333,7 @@ class CodeArtifact(StrictBase):
     entrypoint: str | None = None
     language: str | None = None
     description: str | None = None
-    cluster_id: int | None = None
+    task_id: int | None = None
     related_concepts: list[int | str] = Field(default_factory=list)
     related_conjectures: list[int] = Field(default_factory=list)
     tests_path: str | None = None
@@ -351,7 +347,7 @@ class ExperimentRun(StrictBase):
 
     run_id: int | None = None
     artifact_id: int | None = None
-    cluster_id: int | None = None
+    task_id: int | None = None
     conjecture_id: int | None = None
     experiment_type: str = Field(min_length=1)
     input_path: str | None = None
@@ -368,13 +364,48 @@ class ResearchEvent(StrictBase):
     """Append-only provenance event for a project timeline."""
 
     event_id: int | None = None
-    cluster_id: int | None = None
+    task_id: int | None = None
     event_type: str = Field(min_length=1)
     object_type: str = Field(min_length=1)
     object_id: int | None = None
     summary: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str | None = None
+
+
+ResearchUnitStatus = Literal["proposed", "ready", "active", "blocked", "finished", "abandoned"]
+ResearchUnitRelation = Literal["investigates", "uses", "produces", "supports", "challenges"]
+ResearchUnitObjectType = Literal[
+    "paper", "concept", "model", "theorem", "reduction", "open_problem",
+    "conjecture", "derived_result", "proof_attempt", "evidence",
+    "literature_note", "literature_summary", "experiment_run", "code_artifact",
+    "pending_entry",
+]
+
+
+class ResearchUnit(StrictBase):
+    """One research activity within a task; children capture new directions."""
+
+    unit_id: int | None = None
+    task_id: int = Field(gt=0)
+    kind: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=300)
+    purpose: str = Field(min_length=1)
+    status: ResearchUnitStatus = "proposed"
+    outcome_note: str | None = None
+    priority: int = 0
+    parent_unit_id: int | None = Field(default=None, gt=0)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class ResearchUnitLink(StrictBase):
+    """A typed input, target, or output of one research activity."""
+
+    unit_id: int = Field(gt=0)
+    relation: ResearchUnitRelation
+    object_type: ResearchUnitObjectType
+    object_id: int = Field(gt=0)
 
 
 class ResearchTopic(StrictBase):

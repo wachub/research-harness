@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -32,6 +33,10 @@ TModel = TypeVar("TModel", bound=BaseModel)
 class LLMError(RuntimeError):
     """A safe, non-secret-bearing LLM request or response error."""
 
+    def __init__(self, message: str, *, details: tuple[dict[str, str], ...] = ()) -> None:
+        super().__init__(message)
+        self.details = details
+
 
 @dataclass(frozen=True)
 class LLMMessage:
@@ -48,6 +53,7 @@ class LLMRequest:
     messages: tuple[LLMMessage, ...]
     temperature: float = 0.0
     json_mode: bool = False
+    response_schema: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -128,7 +134,12 @@ class OpenAICompatibleProvider:
                 for message in request.messages
             ],
         }
-        if request.json_mode:
+        if request.response_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "structured_response", "schema": request.response_schema},
+            }
+        elif request.json_mode:
             payload["response_format"] = {"type": "json_object"}
 
         request_data = json.dumps(payload).encode("utf-8")
@@ -243,6 +254,7 @@ class LLMClient:
                 messages=request.messages,
                 temperature=request.temperature,
                 json_mode=True,
+                response_schema=request.response_schema,
             )
         response = self.complete(request)
         try:
@@ -252,7 +264,9 @@ class LLMClient:
         try:
             return response_model.model_validate(payload)
         except ValidationError as exc:
-            raise LLMError("LLM provider JSON failed validation") from exc
+            details = tuple(_validation_detail(error) for error in exc.errors(include_input=False, include_url=False)[:20])
+            summary = "; ".join(f'{item["field"]} ({item["issue"]})' for item in details)
+            raise LLMError(f"LLM provider JSON failed validation: {summary}", details=details) from exc
 
     def metadata(self) -> dict[str, Any]:
         """Return safe response metadata suitable for CLI diagnostics."""
@@ -264,6 +278,25 @@ class LLMClient:
             "usage": response.usage if response else {},
             "remote_available": self.available,
         }
+
+
+def _validation_detail(error: dict[str, Any]) -> dict[str, str]:
+    """Keep schema locations and error codes, never model-supplied values."""
+
+    parts = []
+    api_key = os.getenv("LLM_API_KEY", "")
+    for part in error["loc"]:
+        if isinstance(part, int):
+            parts.append(str(part))
+        elif (
+            isinstance(part, str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", part)
+            and (not api_key or api_key not in part)
+        ):
+            parts.append(part)
+        else:
+            parts.append("<field>")
+    return {"field": ".".join(parts) or "<root>", "issue": str(error["type"])}
 
 
 def _strip_json_fence(content: str) -> str:

@@ -34,6 +34,7 @@ PROVISIONAL_ACTIONS = frozenset(
         "propose_subquestions",
         "create_pending_conjecture",
         "create_pending_open_problem",
+        "request_literature_review",
         "design_bounded_experiment",
         "run_trusted_experiment",
         "reassess_plan",
