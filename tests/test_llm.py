@@ -157,3 +157,34 @@ def test_memo_organizer_uses_shared_client_and_rejects_unknown_citations(monkeyp
         "## Known Results\n- bad (evidence 8)\n## Conjecture",
         records,
     )
+
+
+def test_validation_error_exposes_fields_without_model_values():
+    from src.schemas import StrictBase
+
+    class RequiredProposal(StrictBase):
+        kind: str
+        title: str
+
+    class BadProvider:
+        provider_name = "fake"
+        model = "fake"
+
+        def complete(self, request):
+            return LLMResponse(
+                content=json.dumps({"research_activities": [{"secret": "test-secret-key"}]}),
+                provider="fake", model="fake",
+            )
+
+    with pytest.raises(LLMError) as caught:
+        LLMClient(provider=BadProvider()).complete_json(
+            LLMRequest(messages=(LLMMessage(role="user", content="test"),)),
+            RequiredProposal,
+        )
+
+    assert {tuple(item.values()) for item in caught.value.details} == {
+        ("kind", "missing"),
+        ("title", "missing"),
+        ("research_activities", "extra_forbidden"),
+    }
+    assert "test-secret-key" not in str(caught.value)

@@ -18,7 +18,7 @@ class PipelineResult:
     """Compact result from a manual pipeline invocation."""
 
     mode: str
-    cluster_id: int
+    task_id: int
     summary: str
 
 
@@ -35,19 +35,19 @@ def run_curator(db_path: str | Path | None = None) -> list[PendingAnalysis]:
 
 
 def generate_examples_for_one_active_conjecture(
-    cluster_id: int,
+    task_id: int,
     db_path: str | Path | None = None,
 ) -> dict:
-    """Generate one small ATS-family example for an active conjecture cluster."""
+    """Generate one small ATS-family example for an active conjecture task."""
 
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
         conjectures = [
             conjecture
-            for conjecture in db.list_conjectures(connection, cluster_id=cluster_id)
+            for conjecture in db.list_conjectures(connection, task_id=task_id)
             if conjecture.status == "active"
         ]
-    seed = cluster_id if conjectures else 0
+    seed = task_id if conjectures else 0
     game = generate_tiny_game(kind="ATS", process_count=2, states_per_process=2, seed=seed)
     return game.to_dict()
 
@@ -68,7 +68,7 @@ def brute_check_generated(game_data: dict, depth: int = 5) -> dict:
 
 
 def store_experiment_result(
-    cluster_id: int,
+    task_id: int,
     experiment_type: str,
     input_json: dict,
     output_json: dict,
@@ -82,7 +82,7 @@ def store_experiment_result(
         return db.insert_experiment_run(
             connection,
             ExperimentRun(
-                cluster_id=cluster_id,
+                task_id=task_id,
                 experiment_type=experiment_type,
                 input_json=input_json,
                 output_json=output_json,
@@ -91,7 +91,7 @@ def store_experiment_result(
         )
 
 
-def run_pipeline(cluster_id: int, mode: str, db_path: str | Path | None = None) -> PipelineResult:
+def run_pipeline(task_id: int, mode: str, db_path: str | Path | None = None) -> PipelineResult:
     """Run a single bounded manual pipeline step."""
 
     if mode == "literature":
@@ -99,14 +99,14 @@ def run_pipeline(cluster_id: int, mode: str, db_path: str | Path | None = None) 
         warning_count = sum(len(analysis.warnings) for analysis in analyses)
         return PipelineResult(
             mode=mode,
-            cluster_id=cluster_id,
+            task_id=task_id,
             summary=f"curated {len(analyses)} pending entries with {warning_count} warnings",
         )
     if mode == "experiments":
-        game = generate_examples_for_one_active_conjecture(cluster_id=cluster_id, db_path=db_path)
+        game = generate_examples_for_one_active_conjecture(task_id=task_id, db_path=db_path)
         output = brute_check_generated(game, depth=5)
         run_id = store_experiment_result(
-            cluster_id=cluster_id,
+            task_id=task_id,
             experiment_type="ats_bounded_safety",
             input_json=game,
             output_json=output,
@@ -115,7 +115,7 @@ def run_pipeline(cluster_id: int, mode: str, db_path: str | Path | None = None) 
         )
         return PipelineResult(
             mode=mode,
-            cluster_id=cluster_id,
+            task_id=task_id,
             summary=f"stored experiment run {run_id}",
         )
     raise ValueError("mode must be literature or experiments")

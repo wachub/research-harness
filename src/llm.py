@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -32,6 +33,10 @@ TModel = TypeVar("TModel", bound=BaseModel)
 class LLMError(RuntimeError):
     """A safe, non-secret-bearing LLM request or response error."""
 
+    def __init__(self, message: str, *, details: tuple[dict[str, str], ...] = ()) -> None:
+        super().__init__(message)
+        self.details = details
+
 
 @dataclass(frozen=True)
 class LLMMessage:
@@ -48,6 +53,9 @@ class LLMRequest:
     messages: tuple[LLMMessage, ...]
     temperature: float = 0.0
     json_mode: bool = False
+    response_schema: dict[str, Any] | None = None
+    model: str | None = None
+    model_role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,14 +129,19 @@ class OpenAICompatibleProvider:
 
     def complete(self, request: LLMRequest) -> LLMResponse:
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": request.model or self.model,
             "temperature": request.temperature,
             "messages": [
                 {"role": message.role, "content": message.content}
                 for message in request.messages
             ],
         }
-        if request.json_mode:
+        if request.response_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "structured_response", "schema": request.response_schema},
+            }
+        elif request.json_mode:
             payload["response_format"] = {"type": "json_object"}
 
         request_data = json.dumps(payload).encode("utf-8")
@@ -146,7 +159,7 @@ class OpenAICompatibleProvider:
                 )
                 with urllib.request.urlopen(http_request, timeout=60) as response:
                     data = json.loads(response.read().decode("utf-8"))
-                return self._parse_response(data)
+                return self._parse_response(data, request.model or self.model)
             except ValueError:
                 last_error = LLMError("LLM provider configuration is invalid")
                 retryable = False
@@ -166,7 +179,7 @@ class OpenAICompatibleProvider:
 
         raise last_error or LLMError("LLM provider request failed")
 
-    def _parse_response(self, data: Any) -> LLMResponse:
+    def _parse_response(self, data: Any, requested_model: str | None = None) -> LLMResponse:
         if not isinstance(data, dict):
             raise LLMError("LLM provider response was not a JSON object")
         choices = data.get("choices")
@@ -185,7 +198,7 @@ class OpenAICompatibleProvider:
         return LLMResponse(
             content=content,
             provider=self.provider_name,
-            model=str(data.get("model") or self.model),
+            model=str(data.get("model") or requested_model or self.model),
             usage=usage,
         )
 
@@ -193,8 +206,18 @@ class OpenAICompatibleProvider:
 class LLMClient:
     """Configured provider client with centralized structured-response handling."""
 
-    def __init__(self, provider: LLMProvider | None = None, configuration: LLMConfiguration | None = None) -> None:
+    def __init__(
+        self,
+        provider: LLMProvider | None = None,
+        configuration: LLMConfiguration | None = None,
+        model_overrides: dict[str, str] | None = None,
+    ) -> None:
         self.configuration = configuration or LLMConfiguration.from_environment()
+        self.model_overrides = {
+            str(role).strip(): str(model).strip()
+            for role, model in (model_overrides or {}).items()
+            if str(role).strip() and str(model).strip()
+        }
         self.provider = provider
         if self.provider is None and self.configuration.remote_enabled:
             self.provider = OpenAICompatibleProvider(
@@ -204,6 +227,7 @@ class LLMClient:
                 base_url=self.configuration.base_url,
             )
         self.last_response: LLMResponse | None = None
+        self.call_metadata: list[dict[str, Any]] = []
 
     @property
     def available(self) -> bool:
@@ -220,9 +244,38 @@ class LLMClient:
     def complete(self, request: LLMRequest) -> LLMResponse:
         if self.provider is None:
             raise LLMError("No remote LLM provider is configured")
-        response = self.provider.complete(request)
+        request = self._route_model(request)
+        try:
+            response = self.provider.complete(request)
+        except LLMError:
+            raise
+        except Exception as exc:
+            # Providers are an external boundary.  Normalize unexpected client
+            # failures so callers never need to handle provider-specific errors.
+            raise LLMError(f"LLM provider request failed: {type(exc).__name__}") from exc
+        if not isinstance(response, LLMResponse):
+            raise LLMError("LLM provider returned an invalid response envelope")
+        if not all(isinstance(value, str) for value in (response.content, response.provider, response.model)):
+            raise LLMError("LLM provider returned an invalid response envelope")
         self.last_response = response
+        self.call_metadata.append({
+            "role": request.model_role, "provider": response.provider,
+            "model": response.model, "usage": response.usage,
+        })
         return response
+
+    def model_for_role(self, role: str) -> str:
+        family = "literature_review" if role.startswith("literature_") else "research_step"
+        return (self.model_overrides.get(role) or self.model_overrides.get(family)
+                or self.model_overrides.get("default") or self.model)
+
+    def _route_model(self, request: LLMRequest) -> LLMRequest:
+        """Apply an optional role-specific model without creating another client."""
+
+        if request.model:
+            return request
+        selected = self.model_for_role(request.model_role or "")
+        return replace(request, model=selected) if self.model_overrides else request
 
     def complete_json(self, request: LLMRequest, response_model: type[TModel]) -> TModel:
         """Request JSON and validate it against the caller's Pydantic model."""
@@ -232,6 +285,9 @@ class LLMClient:
                 messages=request.messages,
                 temperature=request.temperature,
                 json_mode=True,
+                response_schema=request.response_schema,
+                model=request.model,
+                model_role=request.model_role,
             )
         response = self.complete(request)
         try:
@@ -241,7 +297,9 @@ class LLMClient:
         try:
             return response_model.model_validate(payload)
         except ValidationError as exc:
-            raise LLMError(f"LLM provider JSON failed validation: {exc}") from exc
+            details = tuple(_validation_detail(error) for error in exc.errors(include_input=False, include_url=False)[:20])
+            summary = "; ".join(f'{item["field"]} ({item["issue"]})' for item in details)
+            raise LLMError(f"LLM provider JSON failed validation: {summary}", details=details) from exc
 
     def metadata(self) -> dict[str, Any]:
         """Return safe response metadata suitable for CLI diagnostics."""
@@ -253,6 +311,25 @@ class LLMClient:
             "usage": response.usage if response else {},
             "remote_available": self.available,
         }
+
+
+def _validation_detail(error: dict[str, Any]) -> dict[str, str]:
+    """Keep schema locations and error codes, never model-supplied values."""
+
+    parts = []
+    api_key = os.getenv("LLM_API_KEY", "")
+    for part in error["loc"]:
+        if isinstance(part, int):
+            parts.append(str(part))
+        elif (
+            isinstance(part, str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", part)
+            and (not api_key or api_key not in part)
+        ):
+            parts.append(part)
+        else:
+            parts.append("<field>")
+    return {"field": ".".join(parts) or "<root>", "issue": str(error["type"])}
 
 
 def _strip_json_fence(content: str) -> str:

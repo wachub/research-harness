@@ -157,10 +157,10 @@ def _plan_response():
     return {
         "interpreted_goal": "Investigate the supplied goal.",
         "relevant_existing_state": [
-            {"kind": "research_cluster", "object_id": 1, "relevance": "Selected cluster."}
+            {"kind": "research_task", "object_id": 1, "relevance": "Selected task."}
         ],
-        "recommended_cluster_id": 1,
-        "cluster_rationale": "Selected cluster is relevant.",
+        "recommended_task_id": 1,
+        "task_rationale": "Selected task is relevant.",
         "proposed_subquestions": [
             {
                 "question": "Which assumptions matter?",
@@ -208,6 +208,11 @@ def test_cli_remote_extraction_and_planning_keep_all_proposals_pending(monkeypat
             ["--db", str(db_path), "extract-from-text", "--text", "source", "--llm"]
         )
         extract_output = capsys.readouterr().out
+        with db.get_connection(db_path) as connection:
+            assert db.insert_task(
+                connection,
+                db.ResearchTask(name="ATS safety", description="Investigate ATS safety."),
+            ) == 1
         plan_exit = main(
             [
                 "--db",
@@ -215,10 +220,9 @@ def test_cli_remote_extraction_and_planning_keep_all_proposals_pending(monkeypat
                 "plan-research",
                 "--goal",
                 "Investigate ATS safety.",
-                "--cluster-id",
+                "--task-id",
                 "1",
                 "--llm",
-                "--save-pending",
             ]
         )
         plan_output = capsys.readouterr().out
@@ -230,26 +234,26 @@ def test_cli_remote_extraction_and_planning_keep_all_proposals_pending(monkeypat
         problems = db.list_open_problems(connection)
     assert extract_exit == plan_exit == 0
     assert "Inserted pending entries (provider)" in extract_output
-    assert "Saved pending proposals" in plan_output
+    assert "Saved pending proposals" not in plan_output
     assert "test-secret-key" not in extract_output + plan_output
     assert len(server.requests) == 2
-    assert [entry.entry_type for entry in pending] == ["theorem", "conjecture_seed", "open_problem"]
+    assert [entry.entry_type for entry in pending] == ["theorem"]
     assert all(entry.status == "pending" for entry in pending)
     assert theorems == conjectures == problems == []
 
 
-def test_cli_malformed_remote_plan_and_invalid_cluster_write_nothing(monkeypatch, tmp_path, capsys):
+def test_cli_malformed_remote_plan_and_invalid_task_write_nothing(monkeypatch, tmp_path, capsys):
     with _mock_chat_server([{"body": b"not-json"}] * 3) as (base_url, server):
         _configure_loopback_provider(monkeypatch, base_url)
         db_path = tmp_path / "research.db"
         db.initialize_database(db_path)
         exit_code = main(
-            ["--db", str(db_path), "plan-research", "--goal", "goal", "--llm", "--save-pending"]
+            ["--db", str(db_path), "plan-research", "--goal", "goal", "--llm"]
         )
         output = capsys.readouterr().out
-        with pytest.raises(SystemExit, match="cluster 999 does not exist"):
+        with pytest.raises(SystemExit, match="task 999 does not exist"):
             main(
-                ["--db", str(db_path), "plan-research", "--goal", "goal", "--cluster-id", "999", "--llm"]
+                ["--db", str(db_path), "plan-research", "--goal", "goal", "--task-id", "999", "--llm"]
             )
 
     with db.get_connection(db_path) as connection:
@@ -285,3 +289,19 @@ def test_cli_invalid_typed_extraction_candidate_writes_nothing(monkeypatch, tmp_
     assert "LLM extraction failed validation" in output
     assert "test-secret-key" not in output
     assert pending == []
+
+
+def test_optional_json_schema_is_sent_through_shared_provider():
+    schema = Answer.model_json_schema()
+    with _mock_chat_server([{"body": _chat_response('{"answer":"ok"}')}]) as (base_url, server):
+        client = LLMClient(provider=_provider(base_url))
+        answer = client.complete_json(
+            LLMRequest(messages=(LLMMessage(role="user", content="tiny prompt"),), response_schema=schema),
+            Answer,
+        )
+
+    assert answer.answer == "ok"
+    assert server.requests[0]["payload"]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "structured_response", "schema": schema},
+    }

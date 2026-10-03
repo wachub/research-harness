@@ -14,7 +14,6 @@ from .code_artifacts import (
     register_code_artifact,
     update_code_artifact_status,
 )
-from .curate import approve_pending, curate_pending, flag_pending, reject_pending
 from .experiment_manager import run_experiment
 from .extract import LLMClient as ExtractionLLMClient, extract_from_text
 from .experiments.ats_brute_solver import find_memoryless_safety_strategy
@@ -30,11 +29,11 @@ from .literature import (
 )
 from .llm import LLMClient as ProviderLLMClient
 from .llm import LLMError
+from .autonomous_research import AutonomousResearch
 from .orchestrator import run_pipeline
-from .research_controller import ResearchController
-from .research_planning import plan_research, save_plan_as_pending
-from .research_policy import ControllerMode
-from .schemas import Concept, ConceptLink, Conjecture, ResearchCluster
+from .research_units import add_paper_for_unit, record_partial_result
+from .research_planning import plan_research
+from .schemas import Concept, ConceptLink, Conjecture, ResearchTask, ResearchUnit, ResearchUnitLink
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
             "in distributed games and automata-theoretic synthesis."
         )
     )
-    parser.add_argument("--db", default=str(db.DEFAULT_DB_PATH), help="SQLite database path")
+    parser.add_argument("--db", default=db.DEFAULT_DATABASE_URL, help="PostgreSQL database URL")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init-db", help="Create or migrate database tables")
@@ -57,10 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_paper_parser.add_argument("--pdf-path")
     add_paper_parser.add_argument("--url")
     add_paper_parser.add_argument("--notes")
-    add_paper_parser.add_argument("--cluster-id", type=int)
-
+    add_paper_parser.add_argument("--task-id", dest="task_id", type=int)
+    add_paper_parser.add_argument("--unit-id", type=int, help="Literature activity that found this paper")
     list_papers_parser = subparsers.add_parser("list-papers", help="List papers")
-    list_papers_parser.add_argument("--cluster-id", type=int)
+    list_papers_parser.add_argument("--task-id", dest="task_id", type=int)
 
     demo_parser = subparsers.add_parser(
         "research-demo",
@@ -106,25 +105,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Propose reviewable research directions from stored state; never executes them",
     )
     plan_parser.add_argument("--goal", required=True, help="Free-form research objective")
-    plan_parser.add_argument("--cluster-id", type=int, help="Restrict planning to an existing research cluster")
+    plan_parser.add_argument("--task-id", dest="task_id", type=int, help="Restrict planning to an existing research task")
     plan_parser.add_argument("--llm", action="store_true", help="Use the configured remote LLM provider")
-    plan_parser.add_argument(
-        "--save-pending",
-        action="store_true",
-        help="Save compatible proposed conjectures and questions to the existing pending queue",
-    )
 
     controller_parser = subparsers.add_parser(
         "research-loop",
-        help="Run a bounded, policy-governed research controller over one cluster",
+        help="Run bounded autonomous research steps; each successful step creates a unit",
     )
-    controller_parser.add_argument("--goal", required=True, help="High-level research objective")
-    controller_parser.add_argument("--cluster-id", required=True, type=int)
+    controller_parser.add_argument("--unit-id", type=int, help="Build the first step from this unit; otherwise choose automatically")
+    controller_parser.add_argument("--task-id", dest="task_id", required=True, type=int)
     controller_parser.add_argument("--llm", action="store_true", help="Use the configured remote LLM provider")
-    controller_parser.add_argument("--mode", required=True, choices=[mode.value for mode in ControllerMode])
-    controller_parser.add_argument("--max-steps", default=10, type=int)
-    controller_parser.add_argument("--pause-every", type=int)
-    controller_parser.add_argument("--log", help="Append controller provenance to this JSONL path")
+    controller_parser.add_argument("--steps", default=1, type=int, help="Number of completed research units to create")
+    controller_parser.add_argument("--literature-from-unit", action="store_true", help="Force full-text survey as the first step from --unit-id")
 
     extract_parser = subparsers.add_parser("extract-from-text", help="Extract entries into pending queue")
     extract_parser.add_argument("--text", help="Text to extract from")
@@ -132,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument("--prompt-file", help="Prompt file to prepend to the extraction text")
     extract_parser.add_argument("--paper-id", type=int, help="Source paper id to attach to extracted candidates")
     extract_parser.add_argument("--output-json", help="Write extraction metadata to this JSON path")
+    extract_parser.add_argument("--unit-id", type=int, help="Link pending candidates to a research activity")
     extract_parser.add_argument(
         "--llm",
         action="store_true",
@@ -143,54 +136,64 @@ def build_parser() -> argparse.ArgumentParser:
     pdf_extract_parser.add_argument("--pdf", required=True)
     pdf_extract_parser.add_argument("--prompt-file")
     pdf_extract_parser.add_argument("--output-json")
+    pdf_extract_parser.add_argument("--unit-id", type=int, help="Link pending candidates to a research activity")
     pdf_extract_parser.add_argument(
         "--llm",
         action="store_true",
         help="Use the explicitly configured remote LLM provider; otherwise use deterministic extraction",
     )
 
-    pending_parser = subparsers.add_parser("list-pending", help="List pending entries")
-    pending_parser.add_argument("--status", default="pending", help="pending, flagged, approved, rejected, or all")
-    pending_parser.add_argument("--entry-type", help="Filter by entry type")
 
-    curate_parser = subparsers.add_parser("curate-pending", help="Analyze pending entries and print warnings")
-    curate_parser.add_argument("--entry-type", help="Filter by entry type")
-    curate_parser.add_argument("--output-report", help="Write a markdown curation report")
+    task_parser = subparsers.add_parser("add-task", aliases=["add-research-task"], help="Add a research task")
+    task_parser.add_argument("--name", required=True)
+    task_parser.add_argument("--description", required=True, help="Fixed research objective")
 
-    detail_parser = subparsers.add_parser("show-pending-detail", help="Show one pending entry as JSON")
-    detail_parser.add_argument("entry_id", nargs="?", type=int)
-    detail_parser.add_argument("--pending-id", type=int)
+    unit_parser = subparsers.add_parser("add-research-unit", help="Create one research activity in a task")
+    unit_parser.add_argument("--task-id", dest="task_id", required=True, type=int)
+    unit_parser.add_argument("--kind", default="investigation")
+    unit_parser.add_argument("--title", required=True)
+    unit_parser.add_argument("--purpose", required=True)
+    unit_parser.add_argument("--parent-unit-id", type=int)
+    unit_parser.add_argument("--priority", type=int, default=0)
+    unit_parser.add_argument("--status", choices=["proposed", "ready", "active"], default="proposed")
 
-    show_pending_parser = subparsers.add_parser("show-pending", help="Show one pending entry as JSON")
-    show_pending_parser.add_argument("entry_id", nargs="?", type=int)
-    show_pending_parser.add_argument("--pending-id", type=int)
+    units_parser = subparsers.add_parser("list-research-units", help="List activities in creation order")
+    units_parser.add_argument("--task-id", dest="task_id", type=int)
+    units_parser.add_argument("--status")
 
-    approve_parser = subparsers.add_parser("approve-pending", help="Approve a pending entry")
-    approve_parser.add_argument("entry_id", nargs="?", type=int)
-    approve_parser.add_argument("--pending-id", type=int)
-    approve_parser.add_argument("--edits-file", help="JSON file whose payload replaces the pending payload before approval")
-    approve_parser.add_argument("--reject", action="store_true", help="Compatibility: reject instead of approving")
-    approve_parser.add_argument("--reason", help="Compatibility rejection reason")
+    next_unit_parser = subparsers.add_parser("next-research-unit", help="Show the current frontier activity")
+    next_unit_parser.add_argument("--task-id", dest="task_id", required=True, type=int)
 
-    reject_parser = subparsers.add_parser("reject-pending", help="Reject a pending entry")
-    reject_parser.add_argument("entry_id", nargs="?", type=int)
-    reject_parser.add_argument("--pending-id", type=int)
-    reject_parser.add_argument("--reason")
+    show_unit_parser = subparsers.add_parser("show-research-unit", help="Show an activity and its links")
+    show_unit_parser.add_argument("--unit-id", required=True, type=int)
 
-    flag_parser = subparsers.add_parser("flag-pending", help="Flag a pending entry for later review")
-    flag_parser.add_argument("entry_id", nargs="?", type=int)
-    flag_parser.add_argument("--pending-id", type=int)
-    flag_parser.add_argument("--reason", required=True)
+    update_unit_parser = subparsers.add_parser("update-research-unit", help="Update activity status and outcome")
+    update_unit_parser.add_argument("--unit-id", required=True, type=int)
+    update_unit_parser.add_argument("--status", required=True,
+        choices=["proposed", "ready", "active", "blocked", "finished", "abandoned"])
+    update_unit_parser.add_argument("--outcome-note")
 
-    cluster_parser = subparsers.add_parser("add-cluster", help="Add a research cluster")
-    cluster_parser.add_argument("--name", required=True)
-    cluster_parser.add_argument("--description")
-    cluster_parser.add_argument("--status", default="active", choices=["active", "watchlist", "archived"])
-    cluster_parser.add_argument("--priority", default=0, type=int)
-    cluster_parser.add_argument("--notes")
+    link_unit_parser = subparsers.add_parser("link-research-unit", help="Link an existing research object")
+    link_unit_parser.add_argument("--unit-id", required=True, type=int)
+    link_unit_parser.add_argument("--relation", required=True,
+        choices=["investigates", "uses", "produces", "supports", "challenges"])
+    link_unit_parser.add_argument("--object-type", required=True,
+        choices=["research_unit", "paper", "concept", "model", "theorem", "reduction", "open_problem",
+                 "conjecture", "derived_result", "proof_attempt", "evidence",
+                 "literature_note", "literature_summary", "experiment_run",
+                 "code_artifact", "pending_entry"])
+    link_unit_parser.add_argument("--object-id", required=True, type=int)
 
-    list_clusters_parser = subparsers.add_parser("list-clusters", help="List research clusters")
-    list_clusters_parser.add_argument("--status")
+    result_parser = subparsers.add_parser("record-unit-result", help="Record a draft finding and optional follow-up")
+    result_parser.add_argument("--unit-id", required=True, type=int)
+    result_parser.add_argument("--title", required=True)
+    result_parser.add_argument("--statement", required=True)
+    result_parser.add_argument("--notes")
+    result_parser.add_argument("--followup-title")
+    result_parser.add_argument("--followup-purpose")
+    result_parser.add_argument("--followup-kind", default="investigation")
+
+    subparsers.add_parser("list-research-tasks", aliases=["list-tasks"], help="List research tasks")
 
     concept_parser = subparsers.add_parser("add-concept", help="Add an ontology concept")
     concept_parser.add_argument("--name", required=True)
@@ -233,8 +236,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     link_parser.add_argument("--notes")
 
-    by_cluster_parser = subparsers.add_parser("theorems-by-cluster", help="List theorems for a cluster")
-    by_cluster_parser.add_argument("cluster_id", type=int)
+    by_task_parser = subparsers.add_parser("theorems-by-task", help="List theorems for a task")
+    by_task_parser.add_argument("task_id", type=int)
 
     by_model_parser = subparsers.add_parser("theorems-by-model", help="List theorems by model family")
     by_model_parser.add_argument("model_family")
@@ -242,8 +245,8 @@ def build_parser() -> argparse.ArgumentParser:
     by_objective_parser = subparsers.add_parser("theorems-by-objective", help="List theorems by objective family")
     by_objective_parser.add_argument("objective_family")
 
-    op_cluster_parser = subparsers.add_parser("open-problems-by-cluster", help="List open problems for a cluster")
-    op_cluster_parser.add_argument("cluster_id", type=int)
+    op_task_parser = subparsers.add_parser("open-problems-by-task", help="List open problems for a task")
+    op_task_parser.add_argument("task_id", type=int)
 
     subparsers.add_parser("show-research-map", help="Print compact research map summary")
 
@@ -252,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     conjecture_parser.add_argument("--title")
     conjecture_parser.add_argument("--description")
     conjecture_parser.add_argument("--priority", type=int)
-    conjecture_parser.add_argument("--cluster-id", type=int)
+    conjecture_parser.add_argument("--task-id", dest="task_id", type=int)
     conjecture_parser.add_argument("--motivation")
     conjecture_parser.add_argument("--expected-status", default="unknown", choices=["true", "false", "unknown"])
     conjecture_parser.add_argument("--confidence", default="needs_review", choices=["pending", "verified", "rejected", "needs_review"])
@@ -262,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     conjecture_parser.add_argument("--notes")
 
     list_conjectures_parser = subparsers.add_parser("list-conjectures", help="List conjectures")
-    list_conjectures_parser.add_argument("--cluster-id", type=int)
+    list_conjectures_parser.add_argument("--task-id", dest="task_id", type=int)
 
     show_conjecture_parser = subparsers.add_parser("show-conjecture", help="Show a conjecture")
     show_conjecture_parser.add_argument("conjecture_id", nargs="?", type=int)
@@ -285,7 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     brute_parser.add_argument("--depth", type=int, default=5)
 
     pipeline_parser = subparsers.add_parser("run-pipeline", help="Run one bounded manual pipeline step")
-    pipeline_parser.add_argument("--cluster-id", required=True, type=int)
+    pipeline_parser.add_argument("--task-id", dest="task_id", required=True, type=int)
     pipeline_parser.add_argument("--mode", required=True, choices=["literature", "experiments"])
 
     artifact_parser = subparsers.add_parser("register-code-artifact", help="Register reusable code metadata")
@@ -299,7 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     artifact_parser.add_argument("--entrypoint")
     artifact_parser.add_argument("--language")
     artifact_parser.add_argument("--description")
-    artifact_parser.add_argument("--cluster-id", type=int)
+    artifact_parser.add_argument("--task-id", dest="task_id", type=int)
     artifact_parser.add_argument("--related-concepts", default="", help="Semicolon-separated concept ids or names")
     artifact_parser.add_argument("--related-conjectures", default="", help="Semicolon-separated conjecture ids")
     artifact_parser.add_argument("--tests-path")
@@ -322,8 +325,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_experiment_parser.add_argument("--command", required=True, dest="run_command")
     run_experiment_parser.add_argument("--input-path")
     run_experiment_parser.add_argument("--output-path")
-    run_experiment_parser.add_argument("--cluster-id", type=int)
+    run_experiment_parser.add_argument("--task-id", dest="task_id", type=int)
     run_experiment_parser.add_argument("--conjecture-id", type=int)
+    run_experiment_parser.add_argument("--unit-id", type=int, help="Activity that produced this run")
     run_experiment_parser.add_argument("--experiment-type")
     run_experiment_parser.add_argument("--notes")
 
@@ -350,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "add-paper":
-        paper_id = add_paper(
+        details = dict(
             title=args.title,
             authors=_split_semicolon(args.authors),
             year=args.year,
@@ -358,21 +362,27 @@ def main(argv: list[str] | None = None) -> int:
             pdf_path=args.pdf_path,
             url=args.url,
             notes=args.notes,
-            cluster_id=args.cluster_id,
             db_path=args.db,
         )
+        if args.unit_id is not None:
+            unit = _require_unit(args.db, args.unit_id)
+            if args.task_id is not None and args.task_id != unit.task_id:
+                raise SystemExit("paper task and research unit task must match")
+            paper_id = add_paper_for_unit(args.unit_id, **details)
+        else:
+            paper_id = add_paper(task_id=args.task_id, **details)
         print(f"Added paper {paper_id}")
         return 0
 
     if args.command == "list-papers":
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
-            papers = db.list_papers(connection, cluster_id=args.cluster_id)
+            papers = db.list_papers(connection, task_id=args.task_id)
         for paper in papers:
             authors = ", ".join(paper.authors)
-            cluster = f" cluster={paper.cluster_id}" if paper.cluster_id else ""
+            task = f" task={paper.task_id}" if paper.task_id else ""
             venue = f", {paper.venue}" if paper.venue else ""
-            print(f"{paper.id}: {paper.title} ({paper.year}{venue}) - {authors}{cluster}")
+            print(f"{paper.id}: {paper.title} ({paper.year}{venue}) - {authors}{task}")
         return 0
 
     if args.command == "research-demo":
@@ -447,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = plan_research(
                 args.goal,
-                cluster_id=args.cluster_id,
+                task_id=args.task_id,
                 use_llm=args.llm,
                 db_path=args.db,
             )
@@ -460,62 +470,34 @@ def main(argv: list[str] | None = None) -> int:
         payload["provider"] = result.provider_metadata
         payload["message"] = result.message
         print(json.dumps(payload, indent=2, sort_keys=True))
-        if args.save_pending:
-            pending_ids = save_plan_as_pending(result, args.goal, db_path=args.db)
-            print(f"Saved pending proposals: {', '.join(str(entry_id) for entry_id in pending_ids) or 'none'}")
         return 0
 
     if args.command == "research-loop":
         if not args.llm:
             print("research-loop requires --llm and a configured remote LLM provider; nothing was written.")
             return 2
-        controller = ResearchController(
-            ProviderLLMClient(),
-            db_path=args.db,
-            approval_callback=_controller_approval_prompt if args.mode == ControllerMode.INTERACTIVE.value else None,
-        )
         try:
-            result = controller.run(
-                args.goal,
-                args.cluster_id,
-                mode=ControllerMode(args.mode),
-                max_steps=args.max_steps,
-                pause_every=args.pause_every,
-                log_path=args.log,
+            result = AutonomousResearch(ProviderLLMClient(), args.db).run(
+                args.task_id, steps=args.steps, unit_id=args.unit_id,
+                literature_from_unit=args.literature_from_unit,
             )
         except ValueError as exc:
             print(str(exc))
             return 2
-        last_step = result.steps[-1] if result.steps else None
-        print(
-            json.dumps(
-                {
-                    "status": result.status,
-                    "message": result.message,
-                    "goal": result.goal,
-                    "cluster_id": result.cluster_id,
-                    "mode": result.mode,
-                    "steps_completed": result.steps_completed,
-                    "log_path": str(result.log_path) if result.log_path else None,
-                    "last_step": (
-                        {
-                            "step": last_step.step,
-                            "policy_decision": last_step.policy_decision,
-                            "action": last_step.action,
-                            "result": last_step.result,
-                            "success": last_step.success,
-                        }
-                        if last_step
-                        else None
-                    ),
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return 2 if result.status in {"unavailable", "provider_failure", "invalid_output", "action_failure"} else 0
+        print(json.dumps({
+            "status": result.status, "message": result.message,
+            "task_id": result.task_id, "steps_completed": len(result.unit_ids),
+            "research_unit_ids": result.unit_ids,
+            "blocked_research_unit_ids": result.blocked_unit_ids,
+            "diagnostic_id": result.diagnostic_id,
+            "error_type": result.error_type,
+            "error_details": result.error_details,
+        }, indent=2, sort_keys=True))
+        return 0 if result.status == "completed" else 2
 
     if args.command == "extract-from-text":
+        if args.unit_id is not None:
+            _require_unit(args.db, args.unit_id)
         text = _with_prompt(_read_text_arg(args.text, args.file), args.prompt_file)
         client = ExtractionLLMClient(use_configured_provider=args.llm)
         try:
@@ -525,6 +507,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.paper_id:
             _annotate_pending_paper(args.db, entry_ids, args.paper_id)
+        if args.unit_id is not None:
+            _link_pending_to_unit(args.db, args.unit_id, entry_ids)
         if args.output_json:
             payload = {"pending_entry_ids": entry_ids, "paper_id": args.paper_id}
             if args.llm:
@@ -535,6 +519,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "extract-from-pdf":
+        if args.unit_id is not None:
+            _require_unit(args.db, args.unit_id)
         text = _with_prompt(_read_pdfish_text(Path(args.pdf)), args.prompt_file)
         client = ExtractionLLMClient(use_configured_provider=args.llm)
         try:
@@ -543,6 +529,8 @@ def main(argv: list[str] | None = None) -> int:
             print("LLM extraction failed validation; no entries were written.")
             return 2
         _annotate_pending_paper(args.db, entry_ids, args.paper_id)
+        if args.unit_id is not None:
+            _link_pending_to_unit(args.db, args.unit_id, entry_ids)
         if args.output_json:
             payload = {"pending_entry_ids": entry_ids, "paper_id": args.paper_id, "pdf": args.pdf}
             if args.llm:
@@ -555,93 +543,120 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Inserted pending entries from PDF ({mode}): {', '.join(str(entry_id) for entry_id in entry_ids)}")
         return 0
 
-    if args.command == "list-pending":
-        status = None if args.status == "all" else args.status
+
+    if args.command in {"add-task", "add-research-task"}:
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
-            entries = db.list_pending_entries(connection, status=status)
-        if args.entry_type:
-            entries = [entry for entry in entries if entry.entry_type == args.entry_type]
-        for entry in entries:
-            title = entry.payload.get("title") or entry.payload.get("name") or entry.payload.get("summary") or "(untitled)"
-            warning_text = f" warnings={entry.warnings}" if entry.warnings else ""
-            print(f"{entry.id}: {entry.entry_type} [{entry.status}] {str(title)[:100]}{warning_text}")
-        return 0
-
-    if args.command == "curate-pending":
-        analyses = curate_pending(db_path=args.db)
-        if args.entry_type:
-            analyses = [analysis for analysis in analyses if analysis.entry.entry_type == args.entry_type]
-        if args.output_report:
-            _write_curation_report(Path(args.output_report), analyses)
-        for analysis in analyses:
-            title = analysis.entry.payload.get("title") or analysis.entry.payload.get("name") or "(untitled)"
-            print(f"{analysis.entry.id}: {analysis.entry.entry_type} {title}")
-            if analysis.warnings:
-                print("  warnings: " + "; ".join(analysis.warnings))
-            if analysis.duplicates:
-                dupes = ", ".join(f"{d.table}:{d.entry_id}@{d.score:.2f}" for d in analysis.duplicates)
-                print("  duplicates: " + dupes)
-        return 0
-
-    if args.command in {"show-pending-detail", "show-pending"}:
-        entry_id = _resolve_id(args.entry_id, args.pending_id, "pending id")
-        with db.get_connection(args.db) as connection:
-            db.create_tables(connection)
-            entry = db.get_pending_entry(connection, entry_id)
-        if entry is None:
-            raise SystemExit(f"pending entry {entry_id} does not exist")
-        print(json.dumps(entry.model_dump(), indent=2, sort_keys=True))
-        return 0
-
-    if args.command == "approve-pending":
-        entry_id = _resolve_id(args.entry_id, args.pending_id, "pending id")
-        if args.reject:
-            reject_pending(entry_id, reason=args.reason, db_path=args.db)
-            print(f"Rejected pending entry {entry_id}")
-            return 0
-        if args.edits_file:
-            _replace_pending_payload_from_file(args.db, entry_id, Path(args.edits_file))
-        result = approve_pending(entry_id, db_path=args.db)
-        print(f"Approved pending entry {result.pending_id} into {result.inserted_table}:{result.inserted_id}")
-        if result.warnings:
-            print("Warnings: " + "; ".join(result.warnings))
-        return 0
-
-    if args.command == "reject-pending":
-        entry_id = _resolve_id(args.entry_id, args.pending_id, "pending id")
-        reject_pending(entry_id, reason=args.reason, db_path=args.db)
-        print(f"Rejected pending entry {entry_id}")
-        return 0
-
-    if args.command == "flag-pending":
-        entry_id = _resolve_id(args.entry_id, args.pending_id, "pending id")
-        flag_pending(entry_id, reason=args.reason, db_path=args.db)
-        print(f"Flagged pending entry {entry_id}")
-        return 0
-
-    if args.command == "add-cluster":
-        with db.get_connection(args.db) as connection:
-            db.create_tables(connection)
-            cluster_id = db.insert_cluster(
+            task_id = db.insert_task(
                 connection,
-                ResearchCluster(
-                    name=args.name,
-                    description=args.description,
-                    status=args.status,
+                ResearchTask(name=args.name, description=args.description),
+            )
+        print(f"Added task {task_id}")
+        return 0
+
+    if args.command == "add-research-unit":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            unit_id = db.insert_research_unit(
+                connection,
+                ResearchUnit(
+                    task_id=args.task_id,
+                    kind=args.kind,
+                    title=args.title,
+                    purpose=args.purpose,
+                    parent_unit_id=args.parent_unit_id,
                     priority=args.priority,
-                    notes=args.notes,
+                    status=args.status,
                 ),
             )
-        print(f"Added cluster {cluster_id}")
+        print(f"Added research unit {unit_id}")
         return 0
 
-    if args.command == "list-clusters":
+    if args.command == "list-research-units":
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
-            clusters = db.list_clusters(connection, status=args.status)
-        for cluster in clusters:
-            print(f"{cluster.cluster_id}: [{cluster.status}] p={cluster.priority} {cluster.name}")
+            units = db.list_research_units(connection, task_id=args.task_id, status=args.status)
+        for unit in units:
+            parent = f" parent={unit.parent_unit_id}" if unit.parent_unit_id else ""
+            print(f"{unit.unit_id}: task={unit.task_id} [{unit.status}] {unit.kind}: {unit.title}{parent}")
+        return 0
+
+    if args.command == "next-research-unit":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            if db.get_task(connection, args.task_id) is None:
+                raise SystemExit(f"research task {args.task_id} does not exist")
+            unit = db.next_research_unit(connection, args.task_id)
+        if unit is None:
+            print("No open research units in this task.")
+            return 2
+        print(json.dumps(unit.model_dump(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "show-research-unit":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            unit = db.get_research_unit(connection, args.unit_id)
+            if unit is None:
+                raise SystemExit(f"research unit {args.unit_id} does not exist")
+            links = db.list_research_unit_links(connection, args.unit_id)
+            children = db.list_research_unit_children(connection, args.unit_id)
+        print(json.dumps({
+            "unit": unit.model_dump(),
+            "links": [link.model_dump() for link in links],
+            "children": [child.model_dump() for child in children],
+        }, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "update-research-unit":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            unit = db.update_research_unit(
+                connection, args.unit_id, args.status, outcome_note=args.outcome_note,
+            )
+        print(f"Updated research unit {unit.unit_id} to {unit.status}")
+        return 0
+
+    if args.command == "link-research-unit":
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            db.link_research_unit(
+                connection,
+                ResearchUnitLink(
+                    unit_id=args.unit_id,
+                    relation=args.relation,
+                    object_type=args.object_type,
+                    object_id=args.object_id,
+                ),
+            )
+        print(f"Linked {args.object_type} {args.object_id} to research unit {args.unit_id}")
+        return 0
+
+    if args.command == "record-unit-result":
+        try:
+            result_id, followup_id = record_partial_result(
+                args.unit_id,
+                args.title,
+                args.statement,
+                notes=args.notes,
+                followup_title=args.followup_title,
+                followup_purpose=args.followup_purpose,
+                followup_kind=args.followup_kind,
+                db_path=args.db,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(f"Recorded draft derived result {result_id}")
+        if followup_id is not None:
+            print(f"Created follow-up research unit {followup_id}")
+        return 0
+
+    if args.command in {"list-tasks", "list-research-tasks"}:
+        with db.get_connection(args.db) as connection:
+            db.create_tables(connection)
+            tasks = db.list_tasks(connection)
+        for task in tasks:
+            print(f"{task.task_id}: {task.name} — {task.description}")
         return 0
 
     if args.command == "add-concept":
@@ -684,8 +699,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Linked concept {args.source} {args.relation} {args.target}")
         return 0
 
-    if args.command == "theorems-by-cluster":
-        _print_theorems(args.db, cluster_id=args.cluster_id)
+    if args.command == "theorems-by-task":
+        _print_theorems(args.db, task_id=args.task_id)
         return 0
 
     if args.command == "theorems-by-model":
@@ -696,10 +711,10 @@ def main(argv: list[str] | None = None) -> int:
         _print_theorems(args.db, objective_family=args.objective_family)
         return 0
 
-    if args.command == "open-problems-by-cluster":
+    if args.command == "open-problems-by-task":
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
-            problems = db.list_open_problems(connection, cluster_id=args.cluster_id)
+            problems = db.list_open_problems(connection, task_id=args.task_id)
         for problem in problems:
             print(f"{problem.id}: {problem.title} [{problem.status}]")
         return 0
@@ -716,7 +731,7 @@ def main(argv: list[str] | None = None) -> int:
                 Conjecture(
                     title=args.title,
                     statement=args.statement,
-                    cluster_id=args.cluster_id,
+                    task_id=args.task_id,
                     motivation=args.motivation or args.description,
                     expected_status=args.expected_status,
                     confidence=args.confidence,
@@ -732,10 +747,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list-conjectures":
         with db.get_connection(args.db) as connection:
             db.create_tables(connection)
-            conjectures = db.list_conjectures(connection, cluster_id=args.cluster_id)
+            conjectures = db.list_conjectures(connection, task_id=args.task_id)
         for conjecture in conjectures:
-            cluster = f" cluster={conjecture.cluster_id}" if conjecture.cluster_id else ""
-            print(f"{conjecture.id}: [{conjecture.status}] {conjecture.title}{cluster}")
+            task = f" task={conjecture.task_id}" if conjecture.task_id else ""
+            print(f"{conjecture.id}: [{conjecture.status}] {conjecture.title}{task}")
         return 0
 
     if args.command == "show-conjecture":
@@ -783,7 +798,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-pipeline":
-        result = run_pipeline(cluster_id=args.cluster_id, mode=args.mode, db_path=args.db)
+        result = run_pipeline(task_id=args.task_id, mode=args.mode, db_path=args.db)
         print(result.summary)
         return 0
 
@@ -795,7 +810,7 @@ def main(argv: list[str] | None = None) -> int:
             entrypoint=args.entrypoint,
             language=args.language,
             description=args.description,
-            cluster_id=args.cluster_id,
+            task_id=args.task_id,
             related_concepts=_split_semicolon(args.related_concepts),
             related_conjectures=_split_ints(args.related_conjectures),
             tests_path=args.tests_path,
@@ -829,17 +844,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-experiment":
+        unit = _require_unit(args.db, args.unit_id) if args.unit_id is not None else None
+        if unit is not None and args.task_id is not None and args.task_id != unit.task_id:
+            raise SystemExit("experiment task and research unit task must match")
         execution = run_experiment(
             artifact_id=args.artifact_id,
             command=args.run_command,
             input_path=args.input_path,
             output_path=args.output_path,
-            cluster_id=args.cluster_id,
+            task_id=unit.task_id if unit is not None else args.task_id,
             conjecture_id=args.conjecture_id,
             experiment_type=args.experiment_type,
             notes=args.notes,
             db_path=args.db,
         )
+        if unit is not None:
+            with db.get_connection(args.db) as connection:
+                db.create_tables(connection)
+                db.link_research_unit(
+                    connection,
+                    ResearchUnitLink(
+                        unit_id=unit.unit_id,
+                        relation="produces",
+                        object_type="experiment_run",
+                        object_id=execution.run_id,
+                    ),
+                )
         print(
             f"Recorded experiment run {execution.run_id}: "
             f"{execution.result_summary} output={execution.result_file}"
@@ -870,7 +900,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _print_theorems(
     db_path: str,
-    cluster_id: int | None = None,
+    task_id: int | None = None,
     model_family: str | None = None,
     objective_family: str | None = None,
 ) -> None:
@@ -878,7 +908,7 @@ def _print_theorems(
         db.create_tables(connection)
         theorems = db.list_theorems(
             connection,
-            cluster_id=cluster_id,
+            task_id=task_id,
             model_family=model_family,
             objective_family=objective_family,
         )
@@ -897,14 +927,14 @@ def _print_theorems(
 def _print_research_map(db_path: str) -> None:
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
-        clusters = db.list_clusters(connection, status="active")
+        tasks = db.list_tasks(connection)
         papers = db.list_papers(connection)
         theorems = db.list_theorems(connection)
         problems = db.list_open_problems(connection)
         conjectures = db.list_conjectures(connection)
-    print("Active clusters")
-    for cluster in clusters[:10]:
-        print(f"- {cluster.cluster_id}: {cluster.name}")
+    print("Research tasks")
+    for task in tasks[:10]:
+        print(f"- {task.task_id}: {task.name}")
     print("Key papers")
     for paper in papers[:10]:
         print(f"- {paper.id}: {paper.title} ({paper.year})")
@@ -921,6 +951,40 @@ def _print_research_map(db_path: str) -> None:
     print("Candidate conjectures")
     for conjecture in conjectures[:10]:
         print(f"- {conjecture.id}: {conjecture.title} [{conjecture.status}]")
+
+
+def _require_unit(db_path: str, unit_id: int) -> ResearchUnit:
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        unit = db.get_research_unit(connection, unit_id)
+    if unit is None:
+        raise SystemExit(f"research unit {unit_id} does not exist")
+    return unit
+
+
+def _link_pending_to_unit(db_path: str, unit_id: int, entry_ids: list[int]) -> None:
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        unit = db.get_research_unit(connection, unit_id)
+        if unit is None:
+            raise ValueError(f"research unit {unit_id} does not exist")
+        for entry_id in entry_ids:
+            entry = db.get_pending_entry(connection, entry_id)
+            if entry is None:
+                raise ValueError(f"pending entry {entry_id} does not exist")
+            if entry.entry_type in {"model", "theorem", "reduction", "open_problem", "conjecture_seed"}:
+                payload = dict(entry.payload)
+                payload["task_id"] = unit.task_id
+                db.update_pending_payload(connection, entry_id, payload)
+            db.link_research_unit(
+                connection,
+                ResearchUnitLink(
+                    unit_id=unit_id,
+                    relation="produces",
+                    object_type="pending_entry",
+                    object_id=entry_id,
+                ),
+            )
 
 
 def _split_semicolon(value: str | None) -> list[str]:
@@ -981,36 +1045,6 @@ def _annotate_pending_paper(db_path: str, entry_ids: list[int], paper_id: int) -
             db.update_pending_payload(connection, entry_id, payload)
 
 
-def _replace_pending_payload_from_file(db_path: str, entry_id: int, edits_file: Path) -> None:
-    payload = json.loads(edits_file.read_text(encoding="utf-8"))
-    with db.get_connection(db_path) as connection:
-        db.create_tables(connection)
-        entry = db.get_pending_entry(connection, entry_id)
-        if entry is None:
-            raise SystemExit(f"pending entry {entry_id} does not exist")
-        warnings = [warning for warning in entry.warnings if warning != "dry-run extraction"]
-        db.update_pending_payload(connection, entry_id, payload, warnings=warnings)
-
-
-def _write_curation_report(path: Path, analyses) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# Pending Entry Curation Report", ""]
-    for analysis in analyses:
-        title = analysis.entry.payload.get("title") or analysis.entry.payload.get("name") or "(untitled)"
-        lines.append(f"## {analysis.entry.id}: {analysis.entry.entry_type} - {title}")
-        if analysis.warnings:
-            lines.append("")
-            lines.append("Warnings:")
-            lines.extend(f"- {warning}" for warning in analysis.warnings)
-        if analysis.duplicates:
-            lines.append("")
-            lines.append("Possible duplicates:")
-            lines.extend(
-                f"- {duplicate.table}:{duplicate.entry_id} score={duplicate.score:.2f} {duplicate.title}"
-                for duplicate in analysis.duplicates
-            )
-        lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _combine_notes(*parts: str | None) -> str | None:
@@ -1038,22 +1072,6 @@ def _configure_output_encoding() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
-def _controller_approval_prompt(action) -> str:
-    """Small interactive boundary for controller actions that require approval."""
-
-    print("Proposed action:")
-    print(f"{action.action_type}: {json.dumps(action.parameters.model_dump(), sort_keys=True)}")
-    print(f"Why: {action.reason}")
-    print(f"Expected effect: {action.expected_effect}")
-    try:
-        answer = input("Approve? [y/N] (s=stop): ").strip().lower()
-    except EOFError:
-        return "reject"
-    if answer in {"y", "yes", "approve"}:
-        return "approve"
-    if answer in {"s", "stop"}:
-        return "stop"
-    return "reject"
 
 
 if __name__ == "__main__":
