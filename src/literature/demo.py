@@ -737,7 +737,7 @@ def _organize_memo_with_llm(
                     LLMMessage(role="user", content=json.dumps(prompt, sort_keys=True)),
                 ),
                 temperature=0.0,
-                json_mode=True,
+                json_mode=True, model_role="literature_memo",
             ),
             MemoOrganization,
         )

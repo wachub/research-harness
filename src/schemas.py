@@ -376,6 +376,7 @@ class ResearchEvent(StrictBase):
 ResearchUnitStatus = Literal["proposed", "ready", "active", "blocked", "finished", "abandoned"]
 ResearchUnitRelation = Literal["investigates", "uses", "produces", "supports", "challenges"]
 ResearchUnitObjectType = Literal[
+    "research_unit",
     "paper", "concept", "model", "theorem", "reduction", "open_problem",
     "conjecture", "derived_result", "proof_attempt", "evidence",
     "literature_note", "literature_summary", "experiment_run", "code_artifact",

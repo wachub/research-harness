@@ -1753,6 +1753,7 @@ def list_research_units_for_object(
 
 
 _UNIT_LINK_TARGETS: dict[str, tuple[str, str]] = {
+    "research_unit": ("research_units", "unit_id"),
     "paper": ("papers", "id"),
     "concept": ("concepts", "concept_id"),
     "model": ("models", "id"),
@@ -1890,6 +1891,11 @@ def link_research_unit(connection: PostgresConnection, link: ResearchUnitLink) -
     ).fetchone()
     if target is None:
         raise ValueError(f"{link.object_type} {link.object_id} does not exist")
+    if link.object_type == "research_unit":
+        if link.relation != "uses" or link.object_id >= link.unit_id:
+            raise ValueError("unit dependencies must use an earlier research unit")
+        if target["task_id"] != unit.task_id:
+            raise ValueError("unit dependencies must belong to the same task")
     if link.relation == "produces":
         target_task = target.get("task_id")
         if link.object_type in {"evidence", "literature_note", "literature_summary"} and target.get("paper_id"):

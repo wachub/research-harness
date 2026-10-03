@@ -293,3 +293,27 @@ def test_literature_selection_accepts_index_without_unused_rationale(monkeypatch
 
     assert paper.title == "Finite-memory games"
     assert paper.pages == ("Page text",)
+
+
+
+def test_discovery_falls_back_to_unique_keyword_match_when_model_returns_null(monkeypatch):
+    work = {
+        "display_name": "Distributed Asynchronous Games With Causal Memory are Undecidable",
+        "publication_year": 2022,
+        "best_oa_location": {
+            "pdf_url": "https://example.org/paper.pdf",
+            "source": {"display_name": "Logical Methods in Computer Science"},
+        },
+        "locations": [],
+        "authorships": [{"author": {"display_name": "A"}}],
+        "id": "https://openalex.org/W1",
+    }
+    monkeypatch.setattr("src.literature.discovery._openalex_works", lambda *_: [work])
+    monkeypatch.setattr("src.literature.discovery._download_pdf", lambda *_: b"%PDF")
+    monkeypatch.setattr("src.literature.discovery.extract_pdf_pages", lambda *_: ("Page text",))
+
+    paper = discover_full_text(
+        "Gimbert process undecidability", client=LLMClient(provider=SequenceProvider([{"index": None}])) ,
+    )
+
+    assert paper.title == work["display_name"]

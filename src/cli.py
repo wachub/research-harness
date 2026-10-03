@@ -178,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     link_unit_parser.add_argument("--relation", required=True,
         choices=["investigates", "uses", "produces", "supports", "challenges"])
     link_unit_parser.add_argument("--object-type", required=True,
-        choices=["paper", "concept", "model", "theorem", "reduction", "open_problem",
+        choices=["research_unit", "paper", "concept", "model", "theorem", "reduction", "open_problem",
                  "conjecture", "derived_result", "proof_attempt", "evidence",
                  "literature_note", "literature_summary", "experiment_run",
                  "code_artifact", "pending_entry"])
@@ -488,6 +488,10 @@ def main(argv: list[str] | None = None) -> int:
             "status": result.status, "message": result.message,
             "task_id": result.task_id, "steps_completed": len(result.unit_ids),
             "research_unit_ids": result.unit_ids,
+            "blocked_research_unit_ids": result.blocked_unit_ids,
+            "diagnostic_id": result.diagnostic_id,
+            "error_type": result.error_type,
+            "error_details": result.error_details,
         }, indent=2, sort_keys=True))
         return 0 if result.status == "completed" else 2
 

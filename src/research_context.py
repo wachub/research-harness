@@ -25,6 +25,8 @@ def load_controller_context(
     task_id: int,
     db_path: str | Path | None = None,
     unit_id: int | None = None,
+    *,
+    allow_finished: bool = False,
 ) -> ControllerContext:
     """Load a bounded current-state snapshot for one existing task."""
 
@@ -37,7 +39,9 @@ def load_controller_context(
         active_unit = db.get_research_unit(connection, unit_id) if unit_id is not None else db.next_research_unit(connection, task_id)
         if unit_id is not None and (active_unit is None or active_unit.task_id != task_id):
             raise ValueError(f"research unit {unit_id} does not belong to task {task_id}")
-        if active_unit is not None and active_unit.status in {"finished", "abandoned"}:
+        if active_unit is not None and (
+            active_unit.status == "abandoned" or (active_unit.status == "finished" and not allow_finished)
+        ):
             raise ValueError(f"research unit {active_unit.unit_id} is closed")
         unit_links = tuple(db.list_research_unit_links(connection, active_unit.unit_id)) if active_unit and active_unit.unit_id else ()
         papers = db.list_papers(connection, task_id=task_id)[:8]
@@ -67,7 +71,8 @@ def load_controller_context(
     summary = {
         "research_units": [
             {"id": item.unit_id, "kind": item.kind, "title": item.title,
-             "status": item.status, "parent_unit_id": item.parent_unit_id}
+             "status": item.status, "parent_unit_id": item.parent_unit_id,
+             "purpose": _short(item.purpose), "outcome": _short(item.outcome_note, 4000)}
             for item in visible_units
         ],
         "task": [{"id": task.task_id, "name": task.name, "description": _short(task.description)}],
@@ -101,7 +106,8 @@ def load_controller_context(
         ],
         "proof_attempts": [
             {"id": item.id, "target_type": item.target_type, "target_id": item.target_id,
-             "status": item.status, "strategy": _short(item.strategy)}
+             "status": item.status, "strategy": _short(item.strategy),
+             "notes": _short(item.notes, 6000)}
             for item in attempts
         ],
         "evidence": [
@@ -137,6 +143,28 @@ def load_controller_context(
         "experiment_run": {item.run_id for item in runs if item.run_id is not None},
         "code_artifact": {item.artifact_id for item in artifacts if item.artifact_id is not None},
     }
+    # Explicitly linked inputs take precedence over general snapshot caps.
+    summary["linked_records"] = []
+    fields = {"title", "name", "statement", "status", "confidence", "source_paper_id",
+              "source_location", "quote_or_summary", "page_start", "page_end",
+              "strategy", "notes", "purpose", "outcome_note", "result_summary",
+              "target_type", "target_id", "dependencies_json"}
+    with db.get_connection(db_path) as connection:
+        for link in unit_links[:20]:
+            if link.object_type not in known_ids:
+                continue
+            table, key = db._UNIT_LINK_TARGETS[link.object_type]
+            row = connection.execute(
+                f"SELECT * FROM {table} WHERE {key} = ?", (link.object_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            summary["linked_records"].append({
+                "kind": link.object_type, "id": link.object_id, "relation": link.relation,
+                "record": {key: _short(value, 4000) if isinstance(value, str) else value
+                           for key, value in dict(row).items() if key in fields},
+            })
+            known_ids[link.object_type].add(link.object_id)
     return ControllerContext(
         task=task, summary=summary, known_ids=known_ids,
         active_unit=active_unit, unit_links=unit_links,

@@ -187,6 +187,7 @@ def assess_literature_need(
                 ),
                 temperature=0.0,
                 json_mode=True,
+                model_role="literature_assessment",
             ),
             LiteratureNeedAssessment,
         )
@@ -250,6 +251,7 @@ def plan_research(
                     LLMMessage(role="user", content=json.dumps(prompt, sort_keys=True)),
                 ),
                 temperature=0.0,
+                model_role="research_planning",
                 json_mode=True,
             ),
             ResearchPlan,

@@ -351,6 +351,7 @@ class ResearchController:
                     ),
                     temperature=0.0,
                     json_mode=True,
+                    model_role="unit_selection",
                 ),
                 UnitChoice,
             )
@@ -384,6 +385,7 @@ class ResearchController:
                 ),
                 temperature=0.0,
                 json_mode=True,
+                model_role="controller_action",
             ),
             ControllerDecision,
         )

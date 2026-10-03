@@ -133,11 +133,11 @@ def project_detail(task_id: int, db_path: str | Path | None = None) -> dict[str,
 def run_research_steps(
     task_id: int, steps: int = 1, unit_id: int | None = None,
     literature_from_unit: bool = False, db_path: str | Path | None = None,
-    client: LLMClient | None = None,
+    client: LLMClient | None = None, model_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Create one completed unit per successful autonomous research step."""
 
-    result = AutonomousResearch(client, db_path).run(
+    result = AutonomousResearch(client or LLMClient(model_overrides=model_overrides), db_path).run(
         task_id, steps=steps, unit_id=unit_id,
         literature_from_unit=literature_from_unit,
     )
@@ -148,12 +148,14 @@ def run_research_steps(
         "error_type": result.error_type,
         "error_details": list(result.error_details),
         "diagnostic_id": result.diagnostic_id,
+        "blocked_research_unit_ids": list(result.blocked_unit_ids),
     }
 
 
 def continue_research(
     task_id: int, unit_id: int | None = None,
     db_path: str | Path | None = None, client: LLMClient | None = None,
+    model_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run one explicit, bounded controller step for the selected task/unit."""
 
@@ -163,7 +165,7 @@ def continue_research(
         if task is None:
             raise ValueError(f"research task {task_id} does not exist")
     goal = task.description or task.name
-    controller = ResearchController(client or LLMClient(), db_path=db_path)
+    controller = ResearchController(client or LLMClient(model_overrides=model_overrides), db_path=db_path)
     result = controller.run(
         goal, task_id, unit_id=unit_id, mode=ControllerMode.AUTONOMOUS, max_steps=1,
     )
@@ -179,10 +181,14 @@ def continue_research(
 def assess_research_unit_literature(
     task_id: int, unit_id: int,
     db_path: str | Path | None = None, client: LLMClient | None = None,
+    model_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Assess existing literature coverage without fetching sources or writing state."""
 
-    result = assess_literature_need(task_id, unit_id, db_path=db_path, client=client)
+    result = assess_literature_need(
+        task_id, unit_id, db_path=db_path,
+        client=client or LLMClient(model_overrides=model_overrides),
+    )
     return {
         "available": result.available,
         "message": result.message,

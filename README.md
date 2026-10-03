@@ -14,6 +14,16 @@ The older extraction and planning helpers still exist internally, but the GUI an
 
 Use Python 3.11 or newer.
 
+On Linux/macOS:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+On Windows PowerShell:
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -94,6 +104,19 @@ unit, or force a full-text literature survey from that unit. Each successful ste
 finished child unit. The database explorer and experiment history remain read-only views.
 Review/approve/reject controls are absent. API keys are not displayed.
 
+Expand **LLM model routing** next to the database connection to choose models for
+activity selection, proof attempts, analysis, literature review, and other actions.
+These settings apply to the browser session and use the existing configured API
+endpoint and key. Blank activity fields inherit the research model; literature
+selection/extraction inherit the literature model. Both fall back to the default.
+If a selected activity has a different specialist model, that model develops the
+activity before it is stored. A model ID must be supported by your endpoint;
+entering a name does not enable a provider's web-search or deep-research tools.
+
+The unit graph shows continuation as solid edges and inputs from other branches
+as dashed edges. The unit inspector shows the recorded outcome, linked object IDs,
+and models used. A finished activity is not a verified scientific result.
+
 ## Initialize The Database
 
 ```powershell
@@ -109,6 +132,9 @@ A research unit is one activity within that task, such as a literature review, h
 investigation, proof attempt, or experiment. Units are added as questions arise; a
 `parent_unit_id` records a follow-up branch, while the task timeline remains chronological.
 Unit status describes work progress; a finished unit does not establish a theorem.
+Combining branches adds `uses` links to earlier research units in the same task.
+Those dependencies form an acyclic graph without a separate Git repository or
+new database tables. Research objects remain reusable across tasks.
 
 ```bash
 python -m src.cli add-research-task --name "Global safety in ATS games" --description "Investigate finite-memory strategies for global safety in three-process ATS games."
@@ -120,8 +146,9 @@ python -m src.cli show-research-unit --unit-id 1
 ```
 
 For literature intake, attach a local PDF to a paper record or let an autonomous
-literature step discover openly accessible full text. It reads PDF text and stores
-source-attributed claims with exact page quotes; it does not store PDF blobs in PostgreSQL.
+literature step discover openly accessible source text. It reads PDFs or HTML
+article/main text and stores source-attributed claims with exact quotes; it does
+not store PDF blobs in PostgreSQL. HTML locations are text sections, not PDF pages.
 
 ```bash
 python -m src.cli add-paper --task-id 1 --title "Example Paper" --authors "A. Author" --year 2026 --pdf-path papers/example.pdf
@@ -178,8 +205,18 @@ Without `--llm` and a configured remote provider, the command writes nothing and
 `research-loop` runs from a fixed task objective. Set `--steps` to the number of
 successful research units to create. The first step may be forced from `--unit-id`;
 later steps select a promising existing unit, so progress may branch. A failed
-provider call, invalid proposal, inaccessible PDF, or failed transaction stops
-the run and reports the units already completed.
+provider call, invalid proposal, inaccessible source, or failed transaction stops
+the run and reports the units already completed. A failed literature retrieval or
+quote check also creates a blocked unit with a diagnostic ID, but no claims. It is
+reported separately and does not count as a completed step. Select that unit on a
+later run to retry or develop another direction.
+
+Continuation includes the selected unit's outcome and up to 20 explicitly linked
+research records, with bounded statement, proof-note, evidence and result text,
+in addition to the task snapshot. Running research sends this context to your
+configured LLM endpoint. Credentials and arbitrary local files are not context.
+Each successful unit records contributing provider/model/usage metadata in its
+timeline event, without storing raw prompts or API keys.
 
 ```bash
 python -m src.cli research-loop --task-id 1 --steps 10 --llm
@@ -196,12 +233,18 @@ working premises with citations and uncertainty; significant conclusions
 depending on them remain draft until a real verification mechanism exists.
 
 Literature discovery uses OpenAlex metadata across publishers and repositories,
-then reads directly available public HTTPS PDFs. It also reads unprocessed local
-PDFs already attached to a task. PDF bytes are not stored in PostgreSQL. The
-extractor requires an exact quote from an extracted page before inserting a
+then reads directly available public HTTPS PDFs, with open HTML article/main text
+as a fallback. Every fallback paper undergoes relevance selection. It also reads
+unprocessed local PDFs already attached to a task. PDF bytes are not stored in
+PostgreSQL. The extractor requires an exact quote from an extracted page or HTML
+text section before inserting a
 source-reported theorem, conjecture, or open problem. It does not bypass
 paywalls, perform OCR, or verify mathematical correctness. Limits are 20 MB,
-100 pages, and 300,000 extracted characters per PDF.
+100 pages, and 300,000 extracted characters per PDF. HTML downloads are limited to
+2 MB and 300,000 extracted characters. Some publisher pages expose only abstracts
+or require JavaScript; this is not universal full-text access, and quotations prove
+source attribution, not the truth or completeness of a claim. Failed downloads
+include safe host/error details in the GUI and private local diagnostic log.
 
 ## Legacy Extraction
 
@@ -349,6 +392,11 @@ python -m src.cli run-pipeline --task-id 1 --mode experiments
 
 ## Tests
 
-```powershell
-python -m pytest
+Tests use a real PostgreSQL server with temporary schemas, but fake LLM and
+discovery responses; they do not require paid provider calls. Export
+`TEST_DATABASE_URL` for a non-production database. On Linux/macOS, disable loading
+your live `.env` so it cannot override offline test assumptions:
+
+```bash
+PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q
 ```

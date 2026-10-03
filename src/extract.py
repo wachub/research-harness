@@ -170,7 +170,7 @@ class LLMClient:
                             ),
                         ),
                         temperature=0.0,
-                        json_mode=True,
+                        json_mode=True, model_role="extraction",
                     ),
                     StructuredExtraction,
                 )
