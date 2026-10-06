@@ -102,19 +102,30 @@ The GUI opens on Research Tasks. Create a fixed objective, choose a task, and ru
 user-defined number of autonomous steps. Optionally focus the first step on any existing
 unit, or force a full-text literature survey from that unit. Each successful step creates a
 finished child unit. The database explorer and experiment history remain read-only views.
-Review/approve/reject controls are absent. API keys are not displayed.
+Review/approve/reject controls are absent. Existing API keys are never prefilled into widgets.
 
-Expand **LLM model routing** next to the database connection to choose models for
-activity selection, proof attempts, analysis, literature review, and other actions.
-These settings apply to the browser session and use the existing configured API
-endpoint and key. Blank activity fields inherit the research model; literature
-selection/extraction inherit the literature model. Both fall back to the default.
+Open **Settings** to configure one active OpenAI-compatible API connection, enter
+a masked API key, change the database connection, and choose models by activity.
+Settings are session-only: they survive page navigation but not a new browser
+session or server restart. They do not overwrite `.env`, write credentials to the
+database, or change other users' sessions. Reset restores the environment defaults.
+Use this credential-entry interface locally; it is not an authenticated public service.
+
+**Load models from API** makes an explicit metadata request to the active endpoint,
+not a completion. Choose returned model IDs from dropdowns, or enter a custom ID
+if the provider does not offer a compatible model list. No API calls are made just
+by opening Settings. An available model is not necessarily free or suitable for
+structured responses. “Inherit” uses the research model for ordinary activities and
+the literature model for literature substeps; both fall back to the default.
 If a selected activity has a different specialist model, that model develops the
 activity before it is stored. A model ID must be supported by your endpoint;
 entering a name does not enable a provider's web-search or deep-research tools.
 
-The unit graph shows continuation as solid edges and inputs from other branches
-as dashed edges. The unit inspector shows the recorded outcome, linked object IDs,
+The compact, height-limited unit graph uses numbered circles and thin left-to-right
+connections, with dashed edges for inputs from other branches. Click a circle (or
+focus it and press Enter/Space) to inspect that unit. Colours and the legend identify
+activity types, not verification status. Full titles
+remain in the inspector and the collapsed all-units table. The unit inspector shows the recorded outcome, linked object IDs,
 and models used. A finished activity is not a verified scientific result.
 
 ## Initialize The Database

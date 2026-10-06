@@ -15,32 +15,38 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.llm import LLMConfiguration
+from src.llm import LLMClient, LLMConfiguration
+from src.gui.settings import settings_view
+from src.gui.unit_graph import GRAPH_CSS, GRAPH_HTML, GRAPH_JS, render_unit_graph
 import streamlit as st
 
 from src import dashboard, db
 
 
 st.set_page_config(page_title="Research Harness", layout="wide")
+# Register in the entry point so each app runtime owns the component definition.
+_UNIT_GRAPH = st.components.v2.component(
+    "research_unit_graph", html=GRAPH_HTML, css=GRAPH_CSS, js=GRAPH_JS,
+)
 
 
 def main() -> None:
     st.title("Research Harness")
     st.caption("Choose a research task, inspect its units, and intervene only where needed.")
     load_dotenv()
+    st.session_state.setdefault("database_url", os.getenv("DATABASE_URL", db.DEFAULT_DATABASE_URL))
+    if st.session_state.pop("clear_api_key_field", False):
+        st.session_state.pop("settings_api_key", None)
+    db_path = st.session_state["database_url"]
+    model_overrides = st.session_state.get("model_routes", {})
     with st.sidebar:
         st.header("Workspace")
         page = st.radio(
             "View",
-            ["Dashboard", "Research Tasks", "Database Explorer", "Experiments", "System Status"],
+            ["Dashboard", "Research Tasks", "Database Explorer", "Experiments", "System Status", "Settings"],
             index=1,
         )
-        with st.expander("Database connection"):
-            db_path = st.text_input(
-                "Database URL", value=os.getenv("DATABASE_URL", db.DEFAULT_DATABASE_URL), type="password",
-            )
-        model_overrides = _model_routing()
-        st.caption("The dashboard never displays API keys or runs commands.")
+        st.caption("API connections, models and database: Settings.")
 
     try:
         if page == "Dashboard":
@@ -51,6 +57,8 @@ def main() -> None:
             _explorer_view(db_path)
         elif page == "Experiments":
             _experiments_view(db_path)
+        elif page == "Settings":
+            settings_view()
         else:
             _system_status_view(db_path)
     except (ValueError, OSError, db.DatabaseError) as exc:
@@ -62,7 +70,7 @@ def _dashboard_view(db_path: str) -> None:
     summary = dashboard.dashboard_summary(db_path)
     _metrics(summary["counts"])
     with st.expander("LLM and system status"):
-        st.json(dashboard.system_status(db_path))
+        st.json(_gui_system_status(db_path))
     st.subheader("Active conjectures")
     _records(summary["active_conjectures"], "dashboard_conjectures")
     st.subheader("Active open problems")
@@ -101,29 +109,24 @@ def _projects_view(db_path: str, model_overrides: dict[str, str] | None = None) 
     units = detail["research_units"]
     st.subheader("Research unit tree")
     if units:
-        st.graphviz_chart(_research_unit_tree(task, units, detail["research_unit_links"]), use_container_width=True)
-        st.caption("Solid arrows show continuation; dashed arrows show inputs from other branches. "
-                   "A finished activity can still contain unverified findings.")
-        st.subheader("Unit details")
-        st.dataframe(
-            [
-                {
-                    "Unit": unit["unit_id"],
-                    "Activity": unit["title"],
-                    "Kind": unit["kind"],
-                    "Status": unit["status"],
-                    "Parent": unit["parent_unit_id"],
-                }
-                for unit in units
-            ],
-            width="stretch", hide_index=True,
-        )
+        render_unit_graph(task, units, detail["research_unit_links"], f"inspect_unit_{selected_id}", _UNIT_GRAPH)
+        st.caption("Click a circle to inspect its unit. Colours show activity type, not verification status. "
+                   "T = task · Numbers = unit IDs · Dashed lines = combined branches.")
+        with st.expander(f"All units ({len(units)})"):
+            st.dataframe(
+                [{"Unit": unit["unit_id"], "Activity": unit["title"],
+                  "Kind": unit["kind"], "Status": unit["status"],
+                  "Parent": unit["parent_unit_id"]} for unit in units],
+                width="stretch", hide_index=True,
+            )
         by_id = {unit["unit_id"]: unit for unit in units}
         inspected_id = st.selectbox(
             "Inspect research unit", list(by_id), key=f"inspect_unit_{selected_id}",
             format_func=lambda value: f'U{value}: {by_id[value]["title"]}',
         )
         inspected = by_id[inspected_id]
+        st.text(inspected["title"])
+        st.caption(f'{inspected["kind"].replace("_", " ")} · {inspected["status"]}')
         st.text(inspected["purpose"])
         st.text(inspected.get("outcome_note") or "No outcome recorded yet.")
         with st.expander("Linked inputs and outputs"):
@@ -196,59 +199,6 @@ def _projects_view(db_path: str, model_overrides: dict[str, str] | None = None) 
             _records([item for item in timeline if item["event_type"] in selected], "project_timeline")
 
 
-def _dot_escape(value: Any) -> str:
-    """Escape user-controlled text before placing it in a Graphviz label."""
-
-    return str(value or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def _research_unit_tree(
-    task: dict[str, Any], units: list[dict[str, Any]],
-    links: dict[str, list[dict[str, Any]]] | None = None,
-) -> str:
-    """Build a compact task-rooted Graphviz tree from persisted unit parent IDs."""
-
-    status_colors = {
-        "active": "#d9f2e6",
-        "proposed": "#e3ecff",
-        "ready": "#e3ecff",
-        "blocked": "#ffe7c2",
-        "completed": "#e5e7eb",
-        "finished": "#e5e7eb",
-        "abandoned": "#f4d7dc",
-    }
-    root_label = _dot_escape("Research task\n" + str(task.get("name") or "Unnamed task"))
-    lines = [
-        "digraph research_units {",
-        '  graph [rankdir=TB, bgcolor="transparent", pad=0.2, nodesep=0.3, ranksep=0.55, splines=ortho];',
-        '  node [shape=box, style="rounded,filled", color="#64748b", fontcolor="#111827", fontname="sans", fontsize=11, margin="0.16,0.10"];',
-        '  edge [color="#94a3b8", penwidth=1.2, arrowsize=0.7];',
-        f'  "task-root" [shape=oval, fillcolor="#c7d2fe", label="{root_label}"];',
-    ]
-    known_ids = {unit.get("unit_id") for unit in units}
-    for unit in units:
-        unit_id = unit.get("unit_id")
-        status = str(unit.get("status") or "unknown")
-        title = str(unit.get("title") or "Untitled unit")
-        kind = str(unit.get("kind") or "activity")
-        label = _dot_escape(f"U{unit_id}\n{title}\n{kind} · {status}")
-        color = status_colors.get(status.casefold(), "#eef2f7")
-        lines.append(f'  "unit-{unit_id}" [fillcolor="{color}", label="{label}"];')
-    for unit in units:
-        unit_id = unit.get("unit_id")
-        parent_id = unit.get("parent_unit_id")
-        source = f'"unit-{parent_id}"' if parent_id in known_ids else '"task-root"'
-        lines.append(f'  {source} -> "unit-{unit_id}";')
-    for unit in units:
-        for link in (links or {}).get(str(unit["unit_id"]), []):
-            if (link["object_type"] == "research_unit" and link["relation"] == "uses"
-                    and link["object_id"] in known_ids
-                    and link["object_id"] != unit.get("parent_unit_id")):
-                lines.append(f'  "unit-{link["object_id"]}" -> "unit-{unit["unit_id"]}" [style=dashed];')
-    lines.append("}")
-    return "\n".join(lines)
-
-
 def _show_task_action(last_action: dict[str, Any]) -> None:
     output = last_action["output"]
     st.subheader("Last run")
@@ -301,7 +251,7 @@ def _experiments_view(db_path: str) -> None:
 def _system_status_view(db_path: str) -> None:
     st.header("System status")
     st.caption("Credentials are intentionally excluded.")
-    st.json(dashboard.system_status(db_path))
+    st.json(_gui_system_status(db_path))
 
 
 def _metrics(counts: dict[str, int]) -> None:
@@ -322,7 +272,7 @@ def _records(records: list[dict[str, Any]], key: str) -> None:
     if not records:
         st.caption("No records.")
         return
-    st.dataframe(_table_rows(records), use_container_width=True, hide_index=True)
+    st.dataframe(_table_rows(records), width="stretch", hide_index=True)
     index = st.selectbox("Show full record", range(len(records)), format_func=lambda item: f"Record {item + 1}", key=f"detail_{key}")
     st.json(records[index])
 
@@ -344,42 +294,16 @@ def _run_research_gui(
     db_path: str, model_overrides: dict[str, str] | None,
 ) -> dict[str, Any]:
     kwargs = {"model_overrides": model_overrides} if model_overrides else {}
+    if configuration := st.session_state.get("api_configuration"):
+        kwargs["client"] = LLMClient(configuration=configuration, model_overrides=model_overrides)
     return dashboard.run_research_steps(task_id, steps, unit_id, literature, db_path, **kwargs)
 
-def _model_routing() -> dict[str, str]:
-    """Collect session-only model overrides without exposing provider secrets."""
-
-    configuration = LLMConfiguration.from_environment()
-    with st.expander("LLM model routing"):
-        st.caption("Session settings for the next run. Use model IDs supported by your configured API endpoint. "
-                   "A model name does not enable a provider's research tools.")
-        st.caption("Blank activity fields inherit the research model; blank literature substeps inherit "
-                   "the literature model. Both fall back to the default.")
-        default_model = st.text_input(
-            "Default model", value=configuration.model, key="llm_default_model",
-        ).strip()
-        role_labels = {
-            "research_step": "Choose next research activity",
-            "proof_attempt": "Proof attempts",
-            "analysis": "Analysis",
-            "partial_result": "Partial results",
-            "conjecture": "Conjectures",
-            "open_problem": "Open problems",
-            "bounded_experiment": "Experiment planning",
-            "literature_review": "Literature review",
-            "literature_selection": "Literature source selection",
-            "literature_extraction": "Literature claim extraction",
-            "unit_selection": "Research-unit selection",
-
-        }
-        overrides: dict[str, str] = {}
-        if default_model and default_model != configuration.model:
-            overrides["default"] = default_model
-        for role, label in role_labels.items():
-            selected = st.text_input(label, value="", key=f"llm_model_{role}").strip()
-            if selected:
-                overrides[role] = selected
-    return overrides
+def _gui_system_status(db_path: str) -> dict[str, Any]:
+    status = dashboard.system_status(db_path)
+    configuration = st.session_state.get("api_configuration") or LLMConfiguration.from_environment()
+    status.update(llm_provider=configuration.provider, llm_model=configuration.model,
+                  remote_llm_available=configuration.remote_enabled)
+    return status
 
 
 if __name__ == "__main__":

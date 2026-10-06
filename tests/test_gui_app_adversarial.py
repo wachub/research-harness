@@ -264,8 +264,11 @@ def test_controller_experiment_is_displayed_as_observation_without_claim_promoti
 @pytest.mark.parametrize("bad_url", ["mysql://localhost/not-supported", "postgresql://localhost:1/unreachable"])
 def test_gui_shows_clear_error_for_invalid_database_urls(tmp_path, monkeypatch, bad_url):
     app = _app(monkeypatch, tmp_path / "healthy-test-schema")
+    _switch(app, "Settings")
     next(item for item in app.text_input if item.label == "Database URL").set_value(bad_url)
+    next(item for item in app.button if item.label == "Apply database").click()
     app.run(timeout=5)
+    _switch(app, "Research Tasks")
     assert not app.exception
     assert app.error
 

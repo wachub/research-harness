@@ -217,7 +217,12 @@ def test_gui_inspector_and_model_routing(state, monkeypatch):
     app = AppTest.from_file(str(db.PROJECT_ROOT / "src/gui/app.py")).run(timeout=10)
     assert not app.exception
     assert any("Earlier partial argument" in item.value for item in app.text)
-    next(item for item in app.text_input if item.key == "llm_model_proof_attempt").set_value("reasoner")
+    app.radio[0].set_value("Settings").run(timeout=10)
+    app.session_state["model_catalog"] = ["reasoner"]
+    app.run(timeout=10)
+    next(item for item in app.selectbox if item.key == "settings_model_proof_attempt").set_value("reasoner")
+    next(item for item in app.button if item.label == "Apply models").click().run(timeout=10)
+    app.radio[0].set_value("Research Tasks").run(timeout=10)
     next(item for item in app.button if item.key == "continue_research").click()
     app.run(timeout=10)
     assert not app.exception
