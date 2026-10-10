@@ -17,13 +17,16 @@ from .schemas import StrictBase
 
 
 ReferenceKind = Literal[
-    "research_cluster",
+    "research_task",
+    "research_unit",
     "concept",
     "paper",
     "theorem",
     "reduction",
     "conjecture",
     "open_problem",
+    "derived_result",
+    "proof_attempt",
     "evidence",
     "experiment_run",
     "code_artifact",
@@ -53,6 +56,12 @@ class Subquestion(StrictBase):
 
 class SubquestionParameters(StrictBase):
     subquestions: list[Subquestion] = Field(min_length=1, max_length=3)
+
+
+class LiteratureReviewParameters(StrictBase):
+    question: str = Field(min_length=1, max_length=500)
+    rationale: str = Field(min_length=1, max_length=1000)
+    uncertainty_note: str = Field(min_length=1, max_length=500)
 
 
 class PendingConjectureParameters(StrictBase):
@@ -116,6 +125,11 @@ class ProposeSubquestionsAction(BaseAction):
     parameters: SubquestionParameters
 
 
+class RequestLiteratureReviewAction(BaseAction):
+    action_type: Literal["request_literature_review"]
+    parameters: LiteratureReviewParameters
+
+
 class CreatePendingConjectureAction(BaseAction):
     action_type: Literal["create_pending_conjecture"]
     parameters: PendingConjectureParameters
@@ -162,6 +176,7 @@ ControllerAction = Annotated[
     InspectStateAction
     | ReviewStoredEvidenceAction
     | ProposeSubquestionsAction
+    | RequestLiteratureReviewAction
     | CreatePendingConjectureAction
     | CreatePendingOpenProblemAction
     | DesignBoundedExperimentAction
@@ -191,7 +206,7 @@ class TrustedExperimentResult:
 
 def get_trusted_artifact(
     artifact_id: int,
-    cluster_id: int,
+    task_id: int,
     db_path: str | Path | None = None,
 ) -> CodeArtifact:
     """Validate controller trust metadata without executing the artifact itself."""
@@ -205,15 +220,16 @@ def get_trusted_artifact(
         raise ValueError(f"code artifact {artifact_id} is not trusted for controller execution")
     if artifact.artifact_type not in {"checker", "solver"}:
         raise ValueError(f"code artifact {artifact_id} is not a trusted checker or solver")
-    if artifact.cluster_id is not None and artifact.cluster_id != cluster_id:
-        raise ValueError(f"code artifact {artifact_id} belongs to another research cluster")
+    if artifact.task_id is not None and artifact.task_id != task_id:
+        raise ValueError(f"code artifact {artifact_id} belongs to another research task")
     return artifact
 
 
 def run_trusted_bounded_experiment(
     parameters: BoundedExperimentParameters,
-    cluster_id: int,
+    task_id: int,
     db_path: str | Path | None = None,
+    connection: db.PostgresConnection | None = None,
 ) -> TrustedExperimentResult:
     """Run the fixed in-process tiny ATS-family safety handler.
 
@@ -221,7 +237,7 @@ def run_trusted_bounded_experiment(
     and any LLM-provided command text are never executed by this handler.
     """
 
-    get_trusted_artifact(parameters.artifact_id, cluster_id, db_path)
+    get_trusted_artifact(parameters.artifact_id, task_id, db_path)
     game = generate_tiny_game(
         kind=parameters.kind,
         process_count=parameters.process_count,
@@ -237,20 +253,21 @@ def run_trusted_bounded_experiment(
         "counterexample": result.counterexample,
     }
     summary = f"winning={result.winning} checked={result.checked_strategies} depth={result.depth}"
-    with db.get_connection(db_path) as connection:
-        db.create_tables(connection)
-        run_id = db.insert_experiment_run(
-            connection,
-            ExperimentRun(
-                artifact_id=parameters.artifact_id,
-                cluster_id=cluster_id,
-                experiment_type="ats_bounded_safety",
-                input_json=game.to_dict(),
-                output_json=output,
-                result_summary=summary,
-                command_run="trusted_in_process:ats_bounded_safety",
-                git_commit_hash=get_current_commit_hash(),
-                notes="Controller-runnable bounded handler; no artifact command was executed.",
-            ),
-        )
+    record = ExperimentRun(
+        artifact_id=parameters.artifact_id,
+        task_id=task_id,
+        experiment_type="ats_bounded_safety",
+        input_json=game.to_dict(),
+        output_json=output,
+        result_summary=summary,
+        command_run="trusted_in_process:ats_bounded_safety",
+        git_commit_hash=get_current_commit_hash(),
+        notes="Controller-runnable bounded handler; no artifact command was executed.",
+    )
+    if connection is None:
+        with db.get_connection(db_path) as owned_connection:
+            db.create_tables(owned_connection)
+            run_id = db.insert_experiment_run(owned_connection, record)
+    else:
+        run_id = db.insert_experiment_run(connection, record)
     return TrustedExperimentResult(run_id=run_id, summary=summary, output=output)

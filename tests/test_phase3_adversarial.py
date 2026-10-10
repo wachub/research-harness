@@ -36,14 +36,19 @@ class StrictAnswer(BaseModel):
     answer: str = Field(min_length=1)
 
 
-def _plan_payload(*, reference_kind="research_cluster", reference_id=1, subquestions=None, conjectures=None):
+def _create_task(db_path) -> None:
+    with db.get_connection(db_path) as connection:
+        assert db.insert_task(connection, db.ResearchTask(name="ATS safety", description="Investigate ATS safety.")) == 1
+
+
+def _plan_payload(*, reference_kind="research_task", reference_id=1, subquestions=None, conjectures=None):
     return {
         "interpreted_goal": "Investigate the supplied ATS safety objective.",
         "relevant_existing_state": [
             {"kind": reference_kind, "object_id": reference_id, "relevance": "Stored context."}
         ],
-        "recommended_cluster_id": 1,
-        "cluster_rationale": "The requested cluster is relevant.",
+        "recommended_task_id": 1,
+        "task_rationale": "The requested task is relevant.",
         "proposed_subquestions": subquestions
         if subquestions is not None
         else [
@@ -82,6 +87,7 @@ def _pending_count(db_path: Path) -> int:
 def test_no_remote_or_unsupported_provider_cannot_plan_or_write(monkeypatch, tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     monkeypatch.setenv("LLM_PROVIDER", "unsupported")
     monkeypatch.setenv("LLM_API_KEY", "not-used")
 
@@ -96,6 +102,7 @@ def test_no_remote_or_unsupported_provider_cannot_plan_or_write(monkeypatch, tmp
 def test_remote_extraction_multiple_valid_candidates_remain_pending_only(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     client = _remote_extraction_client(
         json.dumps(
             {
@@ -127,6 +134,7 @@ def test_remote_extraction_multiple_valid_candidates_remain_pending_only(tmp_pat
 def test_invalid_remote_extraction_envelopes_fall_back_without_durable_writes(content, tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
 
     entry_ids = extract_from_text("plain source text", db_path=db_path, client=_remote_extraction_client(content))
 
@@ -142,6 +150,7 @@ def test_invalid_remote_extraction_envelopes_fall_back_without_durable_writes(co
 def test_invalid_remote_extraction_payload_is_rejected_without_queueing(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     client = _remote_extraction_client(
         json.dumps(
             {"candidates": [{"entry_type": "concept", "payload": {"name": "x", "concept_type": "model", "extra": "no"}}]}
@@ -157,6 +166,7 @@ def test_invalid_remote_extraction_payload_is_rejected_without_queueing(tmp_path
 def test_partial_invalid_remote_extraction_writes_nothing(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     client = _remote_extraction_client(
         json.dumps(
             {
@@ -189,6 +199,7 @@ def test_remote_extraction_does_not_reuse_stale_remote_state_after_a_failure(tmp
 
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     client = ExtractionLLMClient(provider=SequenceProvider(), use_configured_provider=True)
 
     first_ids = extract_from_text("first source", db_path=db_path, client=client)
@@ -221,6 +232,7 @@ def test_structured_output_missing_invalid_or_extra_fields_are_safe(content):
 def test_empty_and_long_offline_extraction_remain_safe_and_pending(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
 
     empty_ids = extract_from_text("", db_path=db_path)
     long_ids = extract_from_text("x" * 200_000, db_path=db_path)
@@ -265,10 +277,11 @@ def test_memo_malformed_or_failed_remote_response_falls_back_deterministically(m
 def test_planner_rejects_unknown_and_out_of_scope_references_without_writes(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     for reference_id in (999, 2):
         result = plan_research(
             "Investigate ATS safety.",
-            cluster_id=1,
+            task_id=1,
             use_llm=True,
             db_path=db_path,
             client=LLMClient(provider=StaticProvider(json.dumps(_plan_payload(reference_id=reference_id)))),
@@ -280,10 +293,11 @@ def test_planner_rejects_unknown_and_out_of_scope_references_without_writes(tmp_
 def test_planner_handles_zero_and_oversized_or_unsupported_proposals_without_writes(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     zero_plan = _plan_payload(subquestions=[], conjectures=[])
     zero_result = plan_research(
         "Investigate ATS safety.",
-        cluster_id=1,
+        task_id=1,
         use_llm=True,
         db_path=db_path,
         client=LLMClient(provider=StaticProvider(json.dumps(zero_plan))),
@@ -297,7 +311,7 @@ def test_planner_handles_zero_and_oversized_or_unsupported_proposals_without_wri
     for payload in (oversized, unsupported):
         result = plan_research(
             "Investigate ATS safety.",
-            cluster_id=1,
+            task_id=1,
             use_llm=True,
             db_path=db_path,
             client=LLMClient(provider=StaticProvider(json.dumps(payload))),
@@ -306,17 +320,18 @@ def test_planner_handles_zero_and_oversized_or_unsupported_proposals_without_wri
     assert _pending_count(db_path) == 0
 
 
-def test_planner_rejects_theorem_ids_from_another_cluster(tmp_path):
+def test_planner_rejects_theorem_ids_from_another_task(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     with db.get_connection(db_path) as connection:
-        cluster_two = db.insert_cluster(connection, db.ResearchCluster(name="Separate cluster"))
-        theorem_id = db.insert_theorem(connection, Theorem(statement="Other cluster theorem.", cluster_id=cluster_two))
+        task_two = db.insert_task(connection, db.ResearchTask(name="Separate task"))
+        theorem_id = db.insert_theorem(connection, Theorem(statement="Other task theorem.", task_id=task_two))
     payload = _plan_payload(reference_kind="theorem", reference_id=theorem_id)
 
     result = plan_research(
         "Investigate ATS safety.",
-        cluster_id=1,
+        task_id=1,
         use_llm=True,
         db_path=db_path,
         client=LLMClient(provider=StaticProvider(json.dumps(payload))),
@@ -326,15 +341,16 @@ def test_planner_rejects_theorem_ids_from_another_cluster(tmp_path):
     assert _pending_count(db_path) == 0
 
 
-def test_invalid_goal_and_cluster_cannot_reach_provider_or_write(tmp_path):
+def test_invalid_goal_and_task_cannot_reach_provider_or_write(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     provider = StaticProvider(json.dumps(_plan_payload()))
     for goal in ("", "   "):
         with pytest.raises(ValidationError):
             plan_research(goal, use_llm=True, db_path=db_path, client=LLMClient(provider=provider))
-    with pytest.raises(ValueError, match="cluster 999"):
-        plan_research("goal", cluster_id=999, use_llm=True, db_path=db_path, client=LLMClient(provider=provider))
+    with pytest.raises(ValueError, match="task 999"):
+        plan_research("goal", task_id=999, use_llm=True, db_path=db_path, client=LLMClient(provider=provider))
     assert provider.requests == []
     assert _pending_count(db_path) == 0
 
@@ -342,6 +358,7 @@ def test_invalid_goal_and_cluster_cannot_reach_provider_or_write(tmp_path):
 def test_failed_planner_request_and_repeated_pending_saves_never_create_durable_state(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     failed = plan_research(
         "goal",
         use_llm=True,
@@ -353,7 +370,7 @@ def test_failed_planner_request_and_repeated_pending_saves_never_create_durable_
 
     result = plan_research(
         "goal",
-        cluster_id=1,
+        task_id=1,
         use_llm=True,
         db_path=db_path,
         client=LLMClient(provider=StaticProvider(json.dumps(_plan_payload()))),
@@ -367,16 +384,17 @@ def test_failed_planner_request_and_repeated_pending_saves_never_create_durable_
     assert _pending_count(db_path) == 4
 
 
-def test_planner_context_includes_populated_cluster_state_without_executing_commands(tmp_path):
+def test_planner_context_includes_populated_task_state_without_executing_commands(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     with db.get_connection(db_path) as connection:
-        paper_id = db.insert_paper(connection, Paper(title="Paper", authors=["A"], year=2026, cluster_id=1))
-        theorem_id = db.insert_theorem(connection, Theorem(statement="Stored theorem.", cluster_id=1))
-        db.insert_conjecture(connection, Conjecture(statement="Stored conjecture.", cluster_id=1))
-        db.insert_open_problem(connection, OpenProblem(title="Stored gap", statement="Stored gap.", cluster_id=1))
+        paper_id = db.insert_paper(connection, Paper(title="Paper", authors=["A"], year=2026, task_id=1))
+        theorem_id = db.insert_theorem(connection, Theorem(statement="Stored theorem.", task_id=1))
+        db.insert_conjecture(connection, Conjecture(statement="Stored conjecture.", task_id=1))
+        db.insert_open_problem(connection, OpenProblem(title="Stored gap", statement="Stored gap.", task_id=1))
         db.insert_evidence_span(connection, EvidenceSpan(paper_id=paper_id, entry_type="theorem", entry_id=theorem_id, quote_or_summary="Stored evidence."))
-        db.insert_experiment_run(connection, ExperimentRun(cluster_id=1, experiment_type="smoke", result_summary="not executed by planner"))
+        db.insert_experiment_run(connection, ExperimentRun(task_id=1, experiment_type="smoke", result_summary="not executed by planner"))
     dependency = "$(touch should-not-run); SELECT * FROM theorems"
     payload = _plan_payload(
         conjectures=[
@@ -392,7 +410,7 @@ def test_planner_context_includes_populated_cluster_state_without_executing_comm
 
     result = plan_research(
         "x" * 100_000,
-        cluster_id=1,
+        task_id=1,
         use_llm=True,
         db_path=db_path,
         client=LLMClient(provider=provider),
@@ -410,9 +428,10 @@ def test_planner_context_includes_populated_cluster_state_without_executing_comm
 def test_pending_plan_writes_are_atomic_when_an_insert_fails(monkeypatch, tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
+    _create_task(db_path)
     result = plan_research(
         "Investigate ATS safety.",
-        cluster_id=1,
+        task_id=1,
         use_llm=True,
         db_path=db_path,
         client=LLMClient(provider=StaticProvider(json.dumps(_plan_payload()))),

@@ -7,7 +7,7 @@ from src import db
 from src.llm import LLMClient, LLMError, LLMResponse
 from src.research_controller import ResearchController
 from src.research_policy import AuthorityDecision, ControllerMode, authority_for
-from src.schemas import CodeArtifact, PendingEntry, ResearchCluster
+from src.schemas import CodeArtifact, PendingEntry, ResearchTask
 
 
 class SequenceProvider:
@@ -37,10 +37,10 @@ def _action(action_type: str, parameters: dict | None = None, references: list[d
     }
 
 
-def _cluster(db_path: Path, name: str = "Controller cluster") -> int:
+def _task(db_path: Path, name: str = "Controller task") -> int:
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
-        return db.insert_cluster(connection, ResearchCluster(name=name))
+        return db.insert_task(connection, ResearchTask(name=name))
 
 
 def _controller(db_path: Path, responses: list[dict], approval=None) -> ResearchController:
@@ -52,7 +52,7 @@ def _pending_count(db_path: Path) -> int:
         return len(db.list_pending_entries(connection))
 
 
-def _tested_artifact(db_path: Path, cluster_id: int) -> int:
+def _tested_artifact(db_path: Path, task_id: int) -> int:
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
         return db.insert_code_artifact(
@@ -61,7 +61,7 @@ def _tested_artifact(db_path: Path, cluster_id: int) -> int:
                 name="Tiny checker",
                 path="src/experiments/ats_brute_solver.py",
                 artifact_type="checker",
-                cluster_id=cluster_id,
+                task_id=task_id,
                 status="tested",
             ),
         )
@@ -77,13 +77,13 @@ def test_authority_policy_is_centralized_for_both_modes():
 
 def test_interactive_mode_asks_and_rejection_creates_no_pending_state(tmp_path):
     db_path = tmp_path / "research.db"
-    cluster_id = _cluster(db_path)
+    task_id = _task(db_path)
     action = _action(
         "create_pending_conjecture",
         {"statement": "A cautious candidate.", "rationale": "Worth review.", "assumptions": [], "uncertainty_note": "Uncertain."},
     )
     result = _controller(db_path, [action], approval=lambda _: "reject").run(
-        "Investigate a question", cluster_id, mode=ControllerMode.INTERACTIVE
+        "Investigate a question", task_id, mode=ControllerMode.INTERACTIVE
     )
     assert result.status == "rejected_by_user"
     assert result.steps[0].policy_decision == "ASK"
@@ -92,44 +92,44 @@ def test_interactive_mode_asks_and_rejection_creates_no_pending_state(tmp_path):
 
 def test_interactive_approval_executes_a_provisional_action_only(tmp_path):
     db_path = tmp_path / "research.db"
-    cluster_id = _cluster(db_path)
+    task_id = _task(db_path)
     action = _action(
         "create_pending_open_problem",
         {"question": "Does a bounded fragment suffice?", "rationale": "The state is incomplete.", "assumptions": [], "uncertainty_note": "Needs review."},
     )
     result = _controller(db_path, [action, _action("stop")], approval=lambda _: "approve").run(
-        "Investigate a question", cluster_id, mode=ControllerMode.INTERACTIVE
+        "Investigate a question", task_id, mode=ControllerMode.INTERACTIVE
     )
     assert result.status == "stopped"
     assert result.steps[0].success is True
     with db.get_connection(db_path) as connection:
-        assert db.list_open_problems(connection, cluster_id=cluster_id) == []
+        assert db.list_open_problems(connection, task_id=task_id) == []
         assert db.list_pending_entries(connection)[0].entry_type == "open_problem"
 
 
 def test_autonomous_mode_creates_only_pending_conjecture_then_stops(tmp_path):
     db_path = tmp_path / "research.db"
-    cluster_id = _cluster(db_path)
+    task_id = _task(db_path)
     create = _action(
         "create_pending_conjecture",
         {"statement": "A cautious candidate.", "rationale": "Worth review.", "assumptions": ["finite arena"], "uncertainty_note": "Uncertain."},
     )
     result = _controller(db_path, [create, _action("stop")]).run(
-        "Investigate a question", cluster_id, mode=ControllerMode.AUTONOMOUS
+        "Investigate a question", task_id, mode=ControllerMode.AUTONOMOUS
     )
     assert result.status == "stopped"
     assert result.steps[0].policy_decision == "AUTO"
     assert _pending_count(db_path) == 1
     with db.get_connection(db_path) as connection:
-        assert db.list_conjectures(connection, cluster_id=cluster_id) == []
+        assert db.list_conjectures(connection, task_id=task_id) == []
 
 
 def test_read_only_action_runs_in_both_modes(tmp_path):
     for mode in (ControllerMode.INTERACTIVE, ControllerMode.AUTONOMOUS):
         db_path = tmp_path / f"{mode.value}.db"
-        cluster_id = _cluster(db_path)
+        task_id = _task(db_path)
         result = _controller(db_path, [_action("inspect_state"), _action("stop")]).run(
-            "Inspect state", cluster_id, mode=mode
+            "Inspect state", task_id, mode=mode
         )
         assert result.steps[0].success is True
         assert result.steps[0].policy_decision == "AUTO"
@@ -137,19 +137,19 @@ def test_read_only_action_runs_in_both_modes(tmp_path):
 
 def test_trusted_experiment_runs_in_process_with_bounded_parameters(tmp_path, monkeypatch):
     db_path = tmp_path / "research.db"
-    cluster_id = _cluster(db_path)
-    artifact_id = _tested_artifact(db_path, cluster_id)
+    task_id = _task(db_path)
+    artifact_id = _tested_artifact(db_path, task_id)
     monkeypatch.setattr("src.experiment_manager.run_experiment", lambda **_: (_ for _ in ()).throw(AssertionError("shell runner used")))
     run = _action(
         "run_trusted_experiment",
         {"artifact_id": artifact_id, "kind": "ATS", "process_count": 2, "states_per_process": 2, "depth": 2, "seed": 7},
     )
     result = _controller(db_path, [run, _action("stop")]).run(
-        "Test tiny games", cluster_id, mode=ControllerMode.AUTONOMOUS
+        "Test tiny games", task_id, mode=ControllerMode.AUTONOMOUS
     )
     assert result.status == "stopped"
     with db.get_connection(db_path) as connection:
-        runs = db.list_experiment_runs(connection, cluster_id=cluster_id)
+        runs = db.list_experiment_runs(connection, task_id=task_id)
     assert len(runs) == 1
     assert runs[0].command_run == "trusted_in_process:ats_bounded_safety"
     assert runs[0].output_json["depth"] == 2
@@ -157,24 +157,24 @@ def test_trusted_experiment_runs_in_process_with_bounded_parameters(tmp_path, mo
 
 def test_explicit_stop_and_max_steps_are_bounded(tmp_path):
     db_path = tmp_path / "research.db"
-    cluster_id = _cluster(db_path)
-    stopped = _controller(db_path, [_action("stop")]).run("Stop", cluster_id, mode=ControllerMode.AUTONOMOUS)
+    task_id = _task(db_path)
+    stopped = _controller(db_path, [_action("stop")]).run("Stop", task_id, mode=ControllerMode.AUTONOMOUS)
     assert stopped.status == "stopped"
     limited = _controller(db_path, [_action("inspect_state"), _action("stop")]).run(
-        "Bound", cluster_id, mode=ControllerMode.AUTONOMOUS, max_steps=1
+        "Bound", task_id, mode=ControllerMode.AUTONOMOUS, max_steps=1
     )
     assert limited.status == "max_steps"
 
 
 def test_pause_every_and_unavailable_provider_do_not_fake_actions(tmp_path):
     db_path = tmp_path / "research.db"
-    cluster_id = _cluster(db_path)
+    task_id = _task(db_path)
     result = _controller(db_path, [_action("inspect_state")]).run(
-        "Pause", cluster_id, mode=ControllerMode.AUTONOMOUS, pause_every=1
+        "Pause", task_id, mode=ControllerMode.AUTONOMOUS, pause_every=1
     )
     assert result.status == "paused_for_review"
     unavailable = ResearchController(LLMClient(), db_path=db_path).run(
-        "Offline", cluster_id, mode=ControllerMode.AUTONOMOUS
+        "Offline", task_id, mode=ControllerMode.AUTONOMOUS
     )
     assert unavailable.status == "unavailable"
     assert unavailable.log_path is None
