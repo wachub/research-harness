@@ -207,6 +207,11 @@ def _show_task_action(last_action: dict[str, Any]) -> None:
         with st.expander("Error details"):
             if output.get("error_type"):
                 st.write(f'Error type: {output["error_type"]}')
+            diagnostics = output.get("diagnostics", {})
+            if diagnostics.get("hint"):
+                st.info(diagnostics["hint"])
+            if diagnostics:
+                st.json(diagnostics)
             if output.get("error_details"):
                 st.json(output["error_details"])
             if output.get("diagnostic_id"):

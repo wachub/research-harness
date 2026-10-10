@@ -284,6 +284,9 @@ def test_failed_research_run_shows_validation_details_and_log_id(tmp_path, monke
             "error_type": "LLMError",
             "error_details": [{"field": "kind", "issue": "missing"}],
             "diagnostic_id": "abc123",
+            "diagnostics": {"category": "quota_exhausted", "http_status": 429,
+                            "hint": "Check API credits and project limits.",
+                            "model": "test-model", "stage": "select_unit"},
         }
 
     monkeypatch.setattr(dashboard, "run_research_steps", failed_run)
@@ -295,3 +298,5 @@ def test_failed_research_run_shows_validation_details_and_log_id(tmp_path, monke
     assert app.error
     assert any("abc123" in str(item.value) for item in app.caption)
     assert any("kind" in str(item.value) for item in app.json)
+    assert any("quota_exhausted" in str(item.value) for item in app.json)
+    assert any("Check API credits" in str(item.value) for item in app.info)

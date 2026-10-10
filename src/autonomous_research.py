@@ -7,9 +7,9 @@ import os
 import traceback
 from datetime import datetime, timezone
 from uuid import uuid4
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -62,6 +62,7 @@ class ResearchRun:
     error_details: tuple[dict[str, str], ...] = ()
     diagnostic_id: str | None = None
     blocked_unit_ids: tuple[int, ...] = ()
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class AutonomousResearch:
@@ -95,8 +96,10 @@ class AutonomousResearch:
             proposal = None
             parent_id = None
             self.client.call_metadata.clear()
+            stage = "select_unit"
             try:
                 parent_id = unit_id if index == 0 and unit_id is not None else self._choose_unit(task_id)
+                stage = "load_context"
                 context = load_controller_context(
                     task_id, self.db_path, parent_id, allow_finished=True,
                 )
@@ -108,20 +111,31 @@ class AutonomousResearch:
                         parent_links = db.list_research_unit_links(connection, parent_id)
                     # Context loader includes and validates the linked input contents.
                 forced_literature = index == 0 and literature_from_unit
+                stage = "propose_step"
                 proposal = self._propose(
                     context.summary, task.description or task.name, parent,
                     [link.model_dump() for link in parent_links], forced_literature,
                 )
                 if forced_literature and proposal.kind != "literature_review":
                     raise ValueError("LLM did not follow the forced literature-survey mode")
+                stage = "validate_references"
                 for reference in proposal.references:
                     validate_context_reference(context, reference.kind, reference.object_id)
                 if proposal.target:
                     validate_context_reference(context, proposal.target.kind, proposal.target.object_id)
+                stage = "execute_step"
                 new_id = self._execute(task_id, parent_id, proposal)
                 created.append(new_id)
             except (LLMError, LiteratureError, ValueError, db.DatabaseError) as exc:
-                incident_id = _record_research_failure(exc, task_id, index + 1)
+                diagnostics = {
+                    **getattr(exc, "diagnostics", {}), "stage": stage,
+                    "parent_unit_id": parent_id,
+                    "proposed_kind": proposal.kind if proposal else None,
+                }
+                incident_id = _record_research_failure(
+                    exc, task_id, index + 1, diagnostics=diagnostics,
+                    api_key=self.client.configuration.api_key,
+                )
                 blocked_ids: tuple[int, ...] = ()
                 # Retrieval failure is a real attempted activity. Keep it resumable,
                 # without storing the model's imagined survey outcome or any claims.
@@ -141,7 +155,7 @@ class AutonomousResearch:
                 return ResearchRun(
                     "stopped", f"Stopped after {len(created)} completed steps: {exc}",
                     task_id, tuple(created), type(exc).__name__,
-                    getattr(exc, "details", ()), incident_id, blocked_ids,
+                    getattr(exc, "details", ()), incident_id, blocked_ids, diagnostics,
                 )
         return ResearchRun("completed", f"Completed {len(created)} research steps.", task_id, tuple(created))
 
@@ -377,14 +391,14 @@ class AutonomousResearch:
 DIAGNOSTIC_LOG = Path(__file__).resolve().parents[1] / "data" / "research_errors.jsonl"
 
 
-def _record_research_failure(exc: Exception, task_id: int, step_number: int) -> str | None:
+def _record_research_failure(
+    exc: Exception, task_id: int, step_number: int, *,
+    diagnostics: dict[str, Any] | None = None, api_key: str = "",
+) -> str | None:
     """Write a private diagnostic without prompts, model output, or credentials."""
 
     incident_id = uuid4().hex[:12]
-    message = str(exc) if isinstance(exc, LLMError) else type(exc).__name__
-    api_key = os.getenv("LLM_API_KEY", "")
-    if api_key:
-        message = message.replace(api_key, "[redacted]")
+    message = str(exc) if isinstance(exc, (LLMError, LiteratureError)) else type(exc).__name__
     record = {
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "incident_id": incident_id,
@@ -393,17 +407,22 @@ def _record_research_failure(exc: Exception, task_id: int, step_number: int) -> 
         "error_type": type(exc).__name__,
         "message": message,
         "validation": getattr(exc, "details", ()),
+        "diagnostics": diagnostics if diagnostics is not None else getattr(exc, "diagnostics", {}),
         "stack": [
             {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
             for frame in traceback.extract_tb(exc.__traceback__)[-12:]
         ],
     }
+    serialized = json.dumps(record, ensure_ascii=False)
+    for secret in (api_key, os.getenv("LLM_API_KEY", ""), os.getenv("OPENALEX_API_KEY", "")):
+        if secret:
+            serialized = serialized.replace(json.dumps(secret, ensure_ascii=False)[1:-1], "[redacted]")
     try:
         DIAGNOSTIC_LOG.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         with os.fdopen(os.open(DIAGNOSTIC_LOG, flags, 0o600), "a", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o600)
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stream.write(serialized + "\n")
     except OSError:
         return None
     return incident_id

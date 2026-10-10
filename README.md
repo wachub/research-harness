@@ -257,6 +257,26 @@ or require JavaScript; this is not universal full-text access, and quotations pr
 source attribution, not the truth or completeness of a claim. Failed downloads
 include safe host/error details in the GUI and private local diagnostic log.
 
+### Failure diagnostics
+
+Failed research runs display a diagnostic ID and details in **Last run → Error
+details**, also returned by `research-loop`. The private, owner-only log is
+`data/research_errors.jsonl`. Each entry includes the UTC time, task/step,
+research stage, parent unit, and stack locations. LLM failures also include
+provider, selected model/role, endpoint host, HTTP status, recognized error code,
+request ID and retry interval when supplied, attempt history and elapsed time.
+Known quota errors are distinguished from rate limiting; an unexplained 429 is
+explicitly labeled ambiguous. Validation errors retain field names and schema
+name, not model output. Literature failures retain their reason and safe download
+details. If writing the local log fails, the GUI says no entry was written.
+
+Raw provider error messages/bodies, prompts, responses, authorization headers,
+full endpoint URLs and API keys are not logged. Only recognized error codes and
+types are retained, so an unknown provider reason may remain unspecified. GUI
+session keys are protected as well as environment keys. These diagnostics do not
+change retry policy or research behavior, and cannot recover details discarded
+by older log entries.
+
 ## Legacy Extraction
 
 `extract-from-text` and `extract-from-pdf` remain available for compatibility.

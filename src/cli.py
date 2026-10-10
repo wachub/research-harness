@@ -492,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
             "diagnostic_id": result.diagnostic_id,
             "error_type": result.error_type,
             "error_details": result.error_details,
+            "diagnostics": result.diagnostics,
         }, indent=2, sort_keys=True))
         return 0 if result.status == "completed" else 2
 

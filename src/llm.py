@@ -8,11 +8,15 @@ structured JSON.  Callers remain responsible for provenance and review.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, TypeVar
 
@@ -33,9 +37,93 @@ TModel = TypeVar("TModel", bound=BaseModel)
 class LLMError(RuntimeError):
     """A safe, non-secret-bearing LLM request or response error."""
 
-    def __init__(self, message: str, *, details: tuple[dict[str, str], ...] = ()) -> None:
+    def __init__(self, message: str, *, details: tuple[dict[str, str], ...] = (),
+                 diagnostics: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.details = details
+        self.diagnostics = diagnostics or {}
+
+
+# Do not log free-form provider messages: they can echo prompts or credentials.
+_QUOTA_CODES = {
+    "insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached",
+    "organization_spend_limit_exceeded", "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+}
+_ERROR_CODES = _QUOTA_CODES | {
+    "rate_limit_exceeded", "slow_down", "server_is_overloaded", "invalid_api_key",
+    "model_not_found", "invalid_request_error", "unsupported_parameter",
+    "unsupported_value", "context_length_exceeded", "server_error",
+}
+_ERROR_TYPES = {"insufficient_quota", "rate_limit_error", "invalid_request_error",
+                "authentication_error", "permission_error", "server_error",
+                "service_unavailable_error"}
+
+
+def _safe_identifier(value: Any, *secrets: str) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", value):
+        return None
+    if any(secret and secret in value for secret in (*secrets, os.getenv("LLM_API_KEY", ""))):
+        return "[redacted]"
+    return value
+
+
+def _http_diagnostics(exc: urllib.error.HTTPError, api_key: str) -> dict[str, Any]:
+    """Extract bounded, allowlisted metadata; never retain a raw response body."""
+    error: dict[str, Any] = {}
+    try:
+        body = json.loads(exc.read(16_384).decode("utf-8"))
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            error = body["error"]
+    except (ValueError, OSError):
+        pass
+    finally:
+        exc.close()
+    code = error.get("code")
+    error_type = error.get("type")
+    code = code if isinstance(code, str) and code in _ERROR_CODES else None
+    error_type = error_type if isinstance(error_type, str) and error_type in _ERROR_TYPES else None
+    category, hint = "http_error", "Check provider availability and connection settings."
+    if exc.code == 429:
+        if code in _QUOTA_CODES or error_type == "insufficient_quota":
+            category, hint = "quota_exhausted", "Check API credits, billing and project/organization usage limits; retrying alone will not help."
+        elif code in {"rate_limit_exceeded", "slow_down"} or error_type == "rate_limit_error":
+            category, hint = "rate_limited", "Wait for the provider's retry interval and reduce request/token rate."
+        else:
+            category, hint = "rate_limit_or_quota", "Provider did not supply a recognized reason. Check both rate limits and API credits/usage limits."
+    elif exc.code == 401:
+        category, hint = "authentication", "Check the API key for the selected endpoint."
+    elif exc.code == 403:
+        category, hint = "permission_denied", "Check project, model and endpoint access permissions."
+    elif exc.code == 404:
+        category, hint = "not_found", "Check the base URL, model name and model access."
+    elif exc.code in {400, 422}:
+        category, hint = "invalid_request", "Check model support for the request parameters and structured-response schema."
+    elif exc.code >= 500:
+        category, hint = "provider_unavailable", "The provider failed; retry later or check its service status."
+    result: dict[str, Any] = {"http_status": exc.code, "category": category, "hint": hint}
+    for name, value in (("error_code", code), ("provider_error_type", error_type)):
+        if value:
+            result[name] = _safe_identifier(value, api_key)
+    param = error.get("param")
+    if isinstance(param, str) and param in {"model", "temperature", "response_format", "max_tokens", "max_completion_tokens", "messages", "service_tier"}:
+        result["error_parameter"] = param
+    headers = exc.headers or {}
+    request_id = _safe_identifier(headers.get("x-request-id") or headers.get("request-id"), api_key)
+    if request_id:
+        result["request_id"] = request_id
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            try:
+                seconds = float(retry_after)
+            except ValueError:
+                seconds = (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()
+            if math.isfinite(seconds) and seconds >= 0:
+                result["retry_after_seconds"] = round(seconds, 3)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return result
 
 
 @dataclass(frozen=True)
@@ -146,6 +234,8 @@ class OpenAICompatibleProvider:
 
         request_data = json.dumps(payload).encode("utf-8")
         last_error: LLMError | None = None
+        started = time.monotonic()
+        attempts: list[dict[str, Any]] = []
         for attempt in range(self._max_attempts):
             try:
                 http_request = urllib.request.Request(
@@ -160,24 +250,57 @@ class OpenAICompatibleProvider:
                 with urllib.request.urlopen(http_request, timeout=60) as response:
                     data = json.loads(response.read().decode("utf-8"))
                 return self._parse_response(data, request.model or self.model)
+            except json.JSONDecodeError:
+                last_error = LLMError("LLM provider returned invalid response JSON",
+                                      diagnostics={"category": "invalid_response"})
+                retryable = False
             except ValueError:
                 last_error = LLMError("LLM provider configuration is invalid")
                 retryable = False
             except urllib.error.HTTPError as exc:
-                last_error = LLMError(f"LLM provider returned HTTP {exc.code}")
+                diagnostics = _http_diagnostics(exc, self._api_key)
+                last_error = LLMError(
+                    f"LLM provider returned HTTP {exc.code}: {diagnostics['category']}",
+                    diagnostics=diagnostics,
+                )
                 retryable = exc.code == 429 or exc.code >= 500
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                last_error = LLMError(f"LLM provider request failed: {type(exc).__name__}")
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_error = LLMError(f"LLM provider request failed: {type(exc).__name__}", diagnostics={
+                    "category": "connection_error", "hint": "Check network, DNS, TLS and provider availability.",
+                })
                 retryable = True
             except OSError as exc:
                 last_error = LLMError(f"LLM provider request failed: {type(exc).__name__}")
                 retryable = True
+            except LLMError as exc:
+                last_error = exc
+                retryable = False
 
+            attempts.append({"attempt": attempt + 1, **last_error.diagnostics})
+            last_error.diagnostics.update({
+                "attempts": attempt + 1, "max_attempts": self._max_attempts,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "attempt_history": list(attempts),
+                **self._request_diagnostics(request),
+            })
             if not retryable or attempt == self._max_attempts - 1:
                 break
+            attempts[-1]["retry_delay_seconds"] = self._retry_delay_seconds * (2**attempt)
             time.sleep(self._retry_delay_seconds * (2**attempt))
 
         raise last_error or LLMError("LLM provider request failed")
+
+    def _request_diagnostics(self, request: LLMRequest) -> dict[str, Any]:
+        try:
+            host = urllib.parse.urlsplit(self._endpoint).hostname
+        except ValueError:
+            host = None
+        return {
+            "provider": _safe_identifier(self.provider_name, self._api_key),
+            "model": _safe_identifier(request.model or self.model, self._api_key),
+            "model_role": _safe_identifier(request.model_role, self._api_key),
+            "endpoint_host": _safe_identifier(host, self._api_key),
+        }
 
     def _parse_response(self, data: Any, requested_model: str | None = None) -> LLMResponse:
         if not isinstance(data, dict):
@@ -247,22 +370,37 @@ class LLMClient:
         request = self._route_model(request)
         try:
             response = self.provider.complete(request)
-        except LLMError:
+        except LLMError as exc:
+            for name, value in self._request_diagnostics(request).items():
+                exc.diagnostics.setdefault(name, value)
             raise
         except Exception as exc:
             # Providers are an external boundary.  Normalize unexpected client
             # failures so callers never need to handle provider-specific errors.
-            raise LLMError(f"LLM provider request failed: {type(exc).__name__}") from exc
+            raise LLMError(f"LLM provider request failed: {type(exc).__name__}",
+                           diagnostics=self._request_diagnostics(request)) from exc
         if not isinstance(response, LLMResponse):
-            raise LLMError("LLM provider returned an invalid response envelope")
+            raise LLMError("LLM provider returned an invalid response envelope",
+                           diagnostics=self._request_diagnostics(request))
         if not all(isinstance(value, str) for value in (response.content, response.provider, response.model)):
-            raise LLMError("LLM provider returned an invalid response envelope")
+            raise LLMError("LLM provider returned an invalid response envelope",
+                           diagnostics=self._request_diagnostics(request))
         self.last_response = response
         self.call_metadata.append({
             "role": request.model_role, "provider": response.provider,
             "model": response.model, "usage": response.usage,
         })
         return response
+
+    def _request_diagnostics(self, request: LLMRequest) -> dict[str, Any]:
+        if isinstance(self.provider, OpenAICompatibleProvider):
+            return self.provider._request_diagnostics(request)
+        key = self.configuration.api_key
+        return {
+            "provider": _safe_identifier(self.provider_name, key),
+            "model": _safe_identifier(request.model or self.model, key),
+            "model_role": _safe_identifier(request.model_role, key),
+        }
 
     def model_for_role(self, role: str) -> str:
         family = "literature_review" if role.startswith("literature_") else "research_step"
@@ -289,17 +427,26 @@ class LLMClient:
                 model=request.model,
                 model_role=request.model_role,
             )
+        started = time.monotonic()
         response = self.complete(request)
+        diagnostics = {
+            **self._request_diagnostics(self._route_model(request)),
+            "response_schema": response_model.__name__,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
         try:
             payload = json.loads(_strip_json_fence(response.content))
         except json.JSONDecodeError as exc:
-            raise LLMError("LLM provider returned invalid JSON") from exc
+            raise LLMError("LLM provider returned invalid JSON", diagnostics={
+                **diagnostics, "category": "invalid_json",
+            }) from exc
         try:
             return response_model.model_validate(payload)
         except ValidationError as exc:
-            details = tuple(_validation_detail(error) for error in exc.errors(include_input=False, include_url=False)[:20])
+            details = tuple(_validation_detail(error, self.configuration.api_key) for error in exc.errors(include_input=False, include_url=False)[:20])
             summary = "; ".join(f'{item["field"]} ({item["issue"]})' for item in details)
-            raise LLMError(f"LLM provider JSON failed validation: {summary}", details=details) from exc
+            raise LLMError(f"LLM provider JSON failed validation: {summary}", details=details,
+                           diagnostics={**diagnostics, "category": "schema_validation"}) from exc
 
     def metadata(self) -> dict[str, Any]:
         """Return safe response metadata suitable for CLI diagnostics."""
@@ -313,7 +460,7 @@ class LLMClient:
         }
 
 
-def _validation_detail(error: dict[str, Any]) -> dict[str, str]:
+def _validation_detail(error: dict[str, Any], active_key: str = "") -> dict[str, str]:
     """Keep schema locations and error codes, never model-supplied values."""
 
     parts = []
@@ -325,6 +472,7 @@ def _validation_detail(error: dict[str, Any]) -> dict[str, str]:
             isinstance(part, str)
             and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", part)
             and (not api_key or api_key not in part)
+            and (not active_key or active_key not in part)
         ):
             parts.append(part)
         else:

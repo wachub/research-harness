@@ -245,10 +245,60 @@ def test_failed_step_writes_private_sanitized_diagnostic(tmp_path, monkeypatch):
     assert record["step_number"] == 1
     assert record["validation"]
     assert record["stack"]
+    assert record["diagnostics"]["stage"] == "propose_step"
+    assert record["diagnostics"]["category"] == "schema_validation"
+    assert record["diagnostics"]["response_schema"] == "StepProposal"
+    assert record["diagnostics"] == result.diagnostics
     assert "test-secret-key" not in log_path.read_text(encoding="utf-8")
     assert log_path.stat().st_mode & 0o777 == 0o600
     with db.get_connection(db_path) as connection:
         assert db.list_research_units(connection, task_id) == []
+
+
+def test_http_failure_context_reaches_gui_output_and_private_log(tmp_path, monkeypatch):
+    import io
+    import urllib.error
+    from src import autonomous_research, dashboard
+    from src.llm import LLMConfiguration
+
+    log_path = tmp_path / "errors.jsonl"
+    monkeypatch.setattr(autonomous_research, "DIAGNOSTIC_LOG", log_path)
+    db_path = tmp_path / "research.db"
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        task_id = db.insert_task(connection, ResearchTask(name="Goal"))
+    secret = "session-only-secret"
+    def fail(*args, **kwargs):
+        body = json.dumps({"error": {"code": "insufficient_quota", "message": secret}}).encode()
+        raise urllib.error.HTTPError("https://example.test", 429, secret, {"x-request-id": "req-123"}, io.BytesIO(body))
+    monkeypatch.setattr("src.llm.urllib.request.urlopen", fail)
+    client = LLMClient(configuration=LLMConfiguration("openai", "test-model", secret, "https://example.test"))
+    client.provider._retry_delay_seconds = 0
+    result = dashboard.run_research_steps(task_id, db_path=db_path, client=client)
+    record = json.loads(log_path.read_text())
+    assert result["status"] == "stopped"
+    assert result["diagnostics"]["category"] == "quota_exhausted"
+    assert result["diagnostics"]["stage"] == "propose_step"
+    assert result["diagnostics"]["request_id"] == "req-123"
+    assert record["diagnostics"] == result["diagnostics"]
+    assert secret not in json.dumps(result) + log_path.read_text()
+
+
+def test_literature_diagnostic_retains_reason_and_redacts_session_key(tmp_path, monkeypatch):
+    from src import autonomous_research
+    log_path = tmp_path / "errors.jsonl"
+    monkeypatch.setattr(autonomous_research, "DIAGNOSTIC_LOG", log_path)
+    error = LiteratureError("No accessible full text; session-secret",
+                            details=({"field": "example.test", "issue": "HTTP 403"},))
+    incident = autonomous_research._record_research_failure(error, 1, 2, api_key="session-secret")
+    record = json.loads(log_path.read_text())
+    assert record["incident_id"] == incident
+    assert "No accessible full text" in record["message"]
+    assert record["validation"][0]["issue"] == "HTTP 403"
+    assert "session-secret" not in log_path.read_text()
+    # A diagnostic write failure must never replace the original failure.
+    monkeypatch.setattr(autonomous_research, "DIAGNOSTIC_LOG", tmp_path)
+    assert autonomous_research._record_research_failure(error, 1, 2) is None
 
 
 def test_proposal_prompt_specifies_exact_single_object_shape():

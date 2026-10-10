@@ -148,6 +148,7 @@ def run_research_steps(
         "error_type": result.error_type,
         "error_details": list(result.error_details),
         "diagnostic_id": result.diagnostic_id,
+        "diagnostics": result.diagnostics,
         "blocked_research_unit_ids": list(result.blocked_unit_ids),
     }
 
