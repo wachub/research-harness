@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -85,7 +86,11 @@ def load_controller_context(
             for item in papers
         ],
         "theorems": [
-            {"id": item.id, "title": item.title, "statement": _short(item.statement), "type": item.theorem_type, "confidence": item.confidence, "source_paper_id": item.source_paper_id}
+            {"id": item.id, "title": item.title, "statement": _short(item.statement), "type": item.theorem_type,
+             "confidence": item.confidence, "source_paper_id": item.source_paper_id,
+             "assumptions": [_short(value) for value in item.assumptions[:20]],
+             "proof_note": _short(item.proof_technique, 2000),
+             "distillation": _distillation_context(item.notes)}
             for item in theorems
         ],
         "reductions": [
@@ -93,15 +98,19 @@ def load_controller_context(
             for item in reductions
         ],
         "conjectures": [
-            {"id": item.id, "title": item.title, "statement": _short(item.statement), "status": item.status, "confidence": item.confidence}
+            {"id": item.id, "title": item.title, "statement": _short(item.statement), "status": item.status,
+             "confidence": item.confidence, "distillation": _distillation_context(item.notes)}
             for item in conjectures
         ],
         "open_problems": [
-            {"id": item.id, "title": item.title, "statement": _short(item.statement), "status": item.status}
+            {"id": item.id, "title": item.title, "statement": _short(item.statement), "status": item.status,
+             "distillation": _distillation_context(item.notes)}
             for item in problems
         ],
         "derived_results": [
-            {"id": item.id, "title": item.title, "statement": _short(item.statement), "status": item.status, "dependencies": item.dependencies}
+            {"id": item.id, "title": item.title, "statement": _short(item.statement), "status": item.status,
+             "dependencies": item.dependencies, "proof_sketch": _short(item.proof_sketch, 2000),
+             "distillation": _distillation_context(item.notes)}
             for item in results
         ],
         "proof_attempts": [
@@ -148,6 +157,7 @@ def load_controller_context(
     fields = {"title", "name", "statement", "status", "confidence", "source_paper_id",
               "source_location", "quote_or_summary", "page_start", "page_end",
               "strategy", "notes", "purpose", "outcome_note", "result_summary",
+              "assumptions_json", "proof_technique", "proof_sketch",
               "target_type", "target_id", "dependencies_json"}
     with db.get_connection(db_path) as connection:
         for link in unit_links[:20]:
@@ -176,6 +186,28 @@ def validate_context_reference(context: ControllerContext, kind: str, object_id:
 
     if object_id not in context.known_ids.get(kind, set()):
         raise ValueError(f"unknown or out-of-scope {kind} id {object_id}")
+
+
+def _distillation_context(notes: str | None) -> dict[str, Any] | None:
+    """Keep conditions and tentative relationships visible after a long statement."""
+    try:
+        wrapper = json.loads(notes or "{}")
+    except ValueError:
+        return None
+    data = wrapper.get("distillation") if isinstance(wrapper, dict) else None
+    if not isinstance(data, dict):
+        return None
+    result: dict[str, Any] = {}
+    for field in ("assumptions", "limitations"):
+        values = data.get(field)
+        result[field] = [_short(value, 500) for value in values[:20] if isinstance(value, str)] if isinstance(values, list) else []
+    for field in ("proof_note", "relevance", "relationship", "relationship_note"):
+        value = data.get(field)
+        result[field] = _short(value, 1600) if isinstance(value, str) else None
+    reference = data.get("related_finding")
+    if isinstance(reference, dict) and isinstance(reference.get("kind"), str) and isinstance(reference.get("object_id"), int):
+        result["related_finding"] = {"kind": reference["kind"], "object_id": reference["object_id"]}
+    return result
 
 
 def _short(value: str | None, limit: int = 500) -> str | None:

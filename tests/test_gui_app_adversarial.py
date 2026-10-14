@@ -286,7 +286,10 @@ def test_failed_research_run_shows_validation_details_and_log_id(tmp_path, monke
             "diagnostic_id": "abc123",
             "diagnostics": {"category": "quota_exhausted", "http_status": 429,
                             "hint": "Check API credits and project limits.",
-                            "model": "test-model", "stage": "select_unit"},
+                            "model": "test-model", "stage": "select_unit",
+                            "literature_trace": [{"stage": "download_pdf", "status": "failed",
+                                                  "host": "example.org", "http_status": 403,
+                                                  "elapsed_seconds": 0.1}]},
         }
 
     monkeypatch.setattr(dashboard, "run_research_steps", failed_run)
@@ -300,3 +303,5 @@ def test_failed_research_run_shows_validation_details_and_log_id(tmp_path, monke
     assert any("kind" in str(item.value) for item in app.json)
     assert any("quota_exhausted" in str(item.value) for item in app.json)
     assert any("Check API credits" in str(item.value) for item in app.info)
+    assert any("Literature stages" in str(item.value) for item in app.caption)
+    assert any("stage" in item.value.columns for item in app.dataframe)

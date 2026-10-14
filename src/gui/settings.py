@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import json
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import replace
 
 import streamlit as st
@@ -27,6 +24,12 @@ ROLE_LABELS = {
     "unit_selection": "Choose research unit",
 }
 
+# Convenience defaults, not a model catalogue or a promise of free API access.
+PROVIDER_DEFAULTS = {
+    "openai": ("https://api.openai.com/v1", "gpt-4.1-mini"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash"),
+}
+
 
 def validate_endpoint(url: str) -> str:
     url = url.strip().rstrip("/")
@@ -37,128 +40,114 @@ def validate_endpoint(url: str) -> str:
     return url
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Never forward the Authorization header to a redirect destination.
-        return None
+def provider_label(configuration: LLMConfiguration) -> str:
+    if configuration.provider == "placeholder":
+        return "offline"
+    for name, (endpoint, _) in PROVIDER_DEFAULTS.items():
+        if configuration.base_url.rstrip("/") == endpoint:
+            return name
+    return "custom"
 
 
-def load_model_ids(configuration: LLMConfiguration) -> list[str]:
-    """Explicit metadata request only: no completion or research is performed."""
-    endpoint = validate_endpoint(configuration.base_url)
-    if not configuration.remote_enabled:
-        raise ValueError("Apply an API connection and key first.")
-    request = urllib.request.Request(
-        endpoint + "/models", headers={"Authorization": f"Bearer {configuration.api_key}"},
-    )
-    try:
-        with urllib.request.build_opener(_NoRedirect).open(request, timeout=15) as response:
-            raw = response.read(1_000_001)
-        if len(raw) > 1_000_000:
-            raise ValueError("Model list exceeds the size limit.")
-        payload = json.loads(raw)
-        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-            raise ValueError("The endpoint did not return an OpenAI-compatible model list.")
-        models = sorted({item["id"] for item in payload["data"]
-                         if isinstance(item, dict) and isinstance(item.get("id"), str)
-                         and 0 < len(item["id"]) <= 200})
-        if not models:
-            raise ValueError("No models were returned. You can enter a model ID manually.")
-        return models
-    except urllib.error.HTTPError as exc:
-        raise ValueError(f"Model list request failed (HTTP {exc.code}). Check the endpoint and key.") from None
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        raise ValueError("Could not read the model list. You can still enter a model ID manually.") from None
+def configure_provider(name: str, key: str, current: LLMConfiguration) -> LLMConfiguration:
+    """Apply an explicit provider choice without reusing credentials across endpoints."""
+    name = name.strip().casefold()
+    name = {"google": "gemini", "google gemini": "gemini", "placeholder": "offline",
+            "openai-compatible": "custom"}.get(name, name)
+    if name == "offline":
+        return replace(current, provider="placeholder", api_key="")
+    if name == "custom":
+        endpoint, model = validate_endpoint(current.base_url), current.model
+    elif name in PROVIDER_DEFAULTS:
+        endpoint, model = PROVIDER_DEFAULTS[name]
+    else:
+        raise ValueError("Enter OpenAI, Gemini, offline, or custom (set its endpoint under Advanced).")
+    same_endpoint = endpoint == current.base_url.rstrip("/")
+    if same_endpoint and current.model and current.model != "placeholder-model" and current.provider != "placeholder":
+        model = current.model
+    api_key = key.strip() or (current.api_key if same_endpoint else "")
+    if not api_key:
+        raise ValueError("Enter a key for this provider; keys are never carried to a different endpoint.")
+    return LLMConfiguration("openai-compatible", model, api_key, endpoint)
 
 
 def settings_view() -> None:
     st.header("Settings")
-    st.caption("Session only: settings survive page changes, but not a new browser session or server restart. "
-               "Nothing is written to .env or the database. Use this credential-entry interface locally.")
+    st.caption("Session only. Nothing is written to .env or the database. Use this interface locally.")
     configuration = st.session_state.get("api_configuration") or LLMConfiguration.from_environment()
+    if st.session_state.pop("settings_clear_models", False):
+        for role in ["default", *ROLE_LABELS]:
+            st.session_state.pop(f"settings_model_{role}", None)
+    if message := st.session_state.pop("settings_notice", None):
+        st.success(message)
     with st.form("connection_settings"):
-        st.subheader("API connection")
-        mode = st.selectbox("Connection", ["OpenAI-compatible API", "Offline"],
-                            index=0 if configuration.remote_enabled else 1, key="settings_api_mode")
-        endpoint = st.text_input("API base URL", value=configuration.base_url, key="settings_api_url",
-                                 help="Use your provider's OpenAI-compatible base URL, not a chat website.")
+        provider = st.text_input("Provider name", value=provider_label(configuration), key="settings_provider",
+                                 help="Type OpenAI or Gemini. Use offline to disable API calls, or custom for another compatible endpoint.")
         key = st.text_input("API key", type="password", key="settings_api_key",
-                            help="Leave blank to retain the current key only when the endpoint is unchanged.")
-        st.caption("A key is configured." if configuration.api_key else "No key configured.")
-        applied = st.form_submit_button("Apply connection")
+                            help="Leave blank to keep the current key for the same endpoint.")
+        applied = st.form_submit_button("Save API settings")
     if applied:
         try:
-            if mode not in {"OpenAI-compatible API", "Offline"}:
-                raise ValueError("Unknown connection type.")
-            endpoint = validate_endpoint(endpoint)
-            changed = endpoint != configuration.base_url.rstrip("/")
-            api_key = key.strip() or (configuration.api_key if not changed else "")
-            if mode != "Offline" and not api_key:
-                raise ValueError("Enter a key for this API endpoint.")
-            configuration = replace(configuration, provider="placeholder" if mode == "Offline" else "openai-compatible",
-                                    api_key="" if mode == "Offline" else api_key, base_url=endpoint)
-            st.session_state["api_configuration"] = configuration
-            if changed:
-                st.session_state["model_catalog"] = []
+            updated = configure_provider(provider, key, configuration)
+            if updated.base_url != configuration.base_url or updated.provider == "placeholder":
                 st.session_state["model_routes"] = {}
-                for role in ["default", *ROLE_LABELS]:
-                    st.session_state.pop(f"settings_model_{role}", None)
-            # Remove the submitted key field on the next render, not after widget creation.
+            st.session_state["api_configuration"] = updated
+            st.session_state["settings_clear_models"] = True
+            st.session_state.pop("settings_api_url", None)
             st.session_state["clear_api_key_field"] = True
-            st.session_state["settings_notice"] = "Connection applied. No API request was made."
+            st.session_state["settings_notice"] = "API settings saved for this session. No API request was made."
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
+    st.caption(f"Active model: {configuration.model} · "
+               + ("API key configured" if configuration.remote_enabled else "Offline / no active key"))
 
-    if message := st.session_state.pop("settings_notice", None):
-        st.success(message)
-    st.subheader("Models by activity")
-    st.caption("Load model IDs from the active API, then select them below. Availability does not imply free usage "
-               "or structured-response support. Changing a model does not enable a deep-research service.")
-    if st.button("Load models from API", disabled=not configuration.remote_enabled, key="load_api_models"):
-        try:
-            with st.spinner("Loading model names…"):
-                st.session_state["model_catalog"] = load_model_ids(configuration)
-            st.success("Model list loaded; no research or completion was requested.")
-        except ValueError as exc:
-            st.warning(str(exc))
-    routes = st.session_state.get("model_routes", {})
-    catalog = sorted(set(st.session_state.get("model_catalog", []))
-                     | {configuration.model} | set(routes.values()))
-    with st.form("model_settings"):
-        default = st.selectbox("Default model", catalog, index=catalog.index(configuration.model),
-                               accept_new_options=True, key="settings_model_default")
-        st.caption("Default applies unless overridden. Literature substeps inherit the literature model; "
-                   "other activities inherit the activity-selection model.")
-        selected = {}
-        left, right = st.columns(2)
-        for index, (role, label) in enumerate(ROLE_LABELS.items()):
-            options = [None, *catalog]
-            with left if index % 2 == 0 else right:
-                selected[role] = st.selectbox(
-                    label, options, index=options.index(routes.get(role)),
-                    format_func=lambda value: "Inherit" if value is None else value,
-                    accept_new_options=True, key=f"settings_model_{role}",
-                )
-        if st.form_submit_button("Apply models"):
-            if not default or not default.strip():
-                st.error("Choose a default model.")
-            else:
-                st.session_state["api_configuration"] = replace(configuration, model=default.strip())
-                st.session_state["model_routes"] = {role: value.strip() for role, value in selected.items()
-                                                   if value and value.strip()}
-                st.success("Models applied to subsequent runs in this session.")
+    with st.expander("Advanced: model IDs, endpoint and activity overrides"):
+        st.caption("Optional. All models use this one endpoint/key. Blank activity fields inherit the default "
+                   "or their activity family. Model names do not enable web search or a deep-research service.")
+        with st.form("model_settings"):
+            endpoint = st.text_input("API base URL", value=configuration.base_url, key="settings_api_url")
+            default = st.text_input("Default model ID", value=configuration.model, key="settings_model_default")
+            routes = st.session_state.get("model_routes", {})
+            selected = {
+                role: st.text_input(label, value=routes.get(role, ""), key=f"settings_model_{role}", placeholder="Inherit")
+                for role, label in ROLE_LABELS.items()
+            }
+            if st.form_submit_button("Apply advanced settings"):
+                try:
+                    endpoint = validate_endpoint(endpoint)
+                    if not default.strip():
+                        raise ValueError("Enter a default model ID.")
+                    changed = endpoint != configuration.base_url.rstrip("/")
+                    st.session_state["api_configuration"] = replace(
+                        configuration, base_url=endpoint, model=default.strip(),
+                        api_key="" if changed else configuration.api_key,
+                        provider="openai-compatible" if changed else configuration.provider,
+                    )
+                    st.session_state["model_routes"] = {} if changed else {
+                        role: value.strip() for role, value in selected.items() if value.strip()
+                    }
+                    st.session_state.pop("settings_provider", None)
+                    st.session_state["clear_api_key_field"] = True
+                    if changed:
+                        st.session_state["settings_notice"] = "Endpoint changed; old key and overrides cleared. Enter the new endpoint's API key above."
+                        st.session_state["settings_clear_models"] = True
+                    else:
+                        st.session_state["settings_notice"] = "Advanced settings saved for subsequent runs."
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
 
-    with st.form("database_settings"):
-        st.subheader("Database")
-        database_url = st.text_input("Database URL", value=st.session_state["database_url"],
-                                     type="password", key="settings_database_url")
-        if st.form_submit_button("Apply database"):
-            if not database_url.strip():
-                st.error("Enter a database URL.")
-            else:
-                st.session_state["database_url"] = database_url.strip()
-                st.success("Database connection updated for this session.")
+    with st.expander("Database connection"):
+        with st.form("database_settings"):
+            database_url = st.text_input("Database URL", value=st.session_state["database_url"],
+                                         type="password", key="settings_database_url")
+            if st.form_submit_button("Apply database"):
+                if not database_url.strip():
+                    st.error("Enter a database URL.")
+                else:
+                    st.session_state["database_url"] = database_url.strip()
+                    st.success("Database connection updated for this session.")
 
     if st.button("Reset session settings", key="reset_settings"):
         for name in list(st.session_state):

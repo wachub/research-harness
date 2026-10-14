@@ -1,433 +1,351 @@
 # Research Harness
 
-Research harness for decidability, complexity, and strategy synthesis in distributed games and automata-theoretic synthesis.
+A local, task-driven research workspace with a Streamlit GUI, a Python CLI,
+PostgreSQL research memory, and an opt-in LLM-assisted research loop. The current
+examples and deterministic experiments concern distributed games and synthesis
+(ATS/CDM/2DM); the system is not a general theorem prover.
 
-This is a local CLI-first system for LICS-style research frontiers across distributed synthesis, asynchronous games, control games, Petri games, games on graphs, imperfect-information games, trace theory, Zielonka/asynchronous automata, MSO/logical characterizations, and parity/safety/reachability/liveness objectives. ATS/CDM/2DM games are supported as one seed model family and experiment layer, not as the boundary of the project.
+## How it works today
 
-## Philosophy
+1. Create a **research task**: a fixed name and research objective.
+2. Start a bounded run of 1–100 steps. The model selects a promising existing
+   **research unit**, or starts from the task when there are no units.
+3. Load task state and the selected unit's linked findings and evidence.
+4. Ask the shared LLM client for one structured activity; validate with Pydantic
+   and check every referenced database ID.
+5. Execute that activity within the implemented limits and store a finished
+   unit, its linked outputs, and a timeline event in one transaction.
 
-The autonomous runner creates one finished research unit per successful step. Model-generated findings remain draft or unverified; experimental observations are not proofs. Source-reported claims may be used as working premises, but their provenance and uncertainty stay visible. No general mathematical proof verifier is implemented.
+A unit is an activity, not a precomputed milestone: literature review, analysis,
+conjecture, open problem, partial result, proof attempt, or a tiny trusted
+experiment. Parent links form branches; `uses` links can combine earlier units
+in the same task. Other research objects may be reused as inputs across tasks.
+The graph is stored in PostgreSQL, **not Git**.
 
-The older extraction and planning helpers still exist internally, but the GUI and CLI no longer expose pending-review approval controls.
+The human can let the system choose, force continuation from a particular unit,
+or force a literature survey from that unit. The first step follows that choice;
+subsequent steps choose again. Runs stop on an error and report completed units.
+A failed literature retrieval or quotation check can leave a **blocked unit**,
+without claims, that can be revisited. Provider/schema failures may stop a run
+before any unit is created.
 
-## Install
+**Finished activity does not mean established result.** Model outputs are drafts
+or unverified. Source-reported claims retain citations and exact evidence quotes.
+They may be working premises, but no general proof verifier exists and the LLM
+cannot mark them verified. The GUI and CLI have no approve/reject review controls.
 
-Use Python 3.11 or newer.
+## Quick start
 
-On Linux/macOS:
+Python 3.11+ and PostgreSQL are required. Run from the repository root:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-On Windows PowerShell:
+Edit the ignored `.env` to set `DATABASE_URL` for your local application database.
+Do not overwrite an existing `.env` when updating the repository.
+On Windows use `python -m venv .venv`, activate with
+`.\.venv\Scripts\Activate.ps1`, and copy the example with
+`Copy-Item .env.example .env`.
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-```
-
-## PostgreSQL Setup
-
-PostgreSQL is the only supported persistence backend. The application never installs or
-controls an operating-system database service during normal runtime. Provision it explicitly:
+After provisioning PostgreSQL (below):
 
 ```bash
-# Debian/Ubuntu only; runs with administrator privileges.
+python -m src.cli init-db
+python -m streamlit run src/gui/app.py --server.address=127.0.0.1 --server.port=8501
+```
+
+Open http://localhost:8501. Go to **Settings**, enter your provider name and API
+key, and save. Then open **Research Tasks**, create an objective, and try **one**
+research step. Larger step counts can make many provider requests.
+
+The GUI is a local tool, not an authenticated public service. Do not expose it
+or its credential-entry forms directly to the Internet.
+
+### PostgreSQL provisioning
+
+PostgreSQL is the only database backend; there is no SQLite mode. Installation
+and privileged provisioning are explicit setup actions, not runtime behavior.
+
+For Debian/Ubuntu without PostgreSQL:
+
+```bash
 sudo ./scripts/install_postgres_debian.sh
 ```
 
-For an existing PostgreSQL server, an administrator can create the restricted application
-role and database with the supplied bootstrap script. Keep credentials only in your shell or
-secret manager; never commit them:
+For an existing server, an administrator can use:
 
 ```bash
 export POSTGRES_ADMIN_URL="postgresql://admin/postgres"
 export RESEARCH_HARNESS_DB_PASSWORD="choose-a-secret"
 python scripts/bootstrap_postgres.py
-export DATABASE_URL="postgresql://research_harness:choose-a-secret/research_harness"
-python -m src.cli init-db
 ```
 
-For self-hosted development, Docker Compose provisions PostgreSQL with a persistent volume:
+The bootstrap creates a missing application role/database, normally both named
+`research_harness`. It does not reset an existing role's password. Set
+`DATABASE_URL` to the application's connection URL, then run `init-db`.
+The schema initializes shared ontology concepts, not seed research tasks.
+
+Alternatively, Docker Compose runs **only PostgreSQL**, not the GUI or LLM:
 
 ```bash
 export POSTGRES_PASSWORD="choose-a-secret"
 docker compose up -d postgres
-export DATABASE_URL="postgresql://research_harness:choose-a-secret/research_harness"
-python -m src.cli init-db
 ```
 
-Tests use isolated, automatically removed PostgreSQL schemas. Set `TEST_DATABASE_URL` to a non-production database before running them; if unset, tests use `DATABASE_URL`.
+Its default database/user are `research_harness`, accessible on localhost:5432.
+Use the matching credentials in `DATABASE_URL`. Data is in the Compose volume.
+Use only one local database service on that port.
 
-## Environment
+## API settings
 
-Create a `.env` file from the example:
+The main Settings form contains two manually entered fields:
 
-```powershell
-Copy-Item .env.example .env
-```
+- **Provider name**: `OpenAI`, `Gemini`, `offline`, or `custom`.
+- **API key**: masked; existing keys are never prefilled into the widget.
 
-The LLM settings are:
+OpenAI and Gemini fill in a compatible endpoint and a default model:
+`gpt-4.1-mini` and `gemini-2.5-flash`, respectively. These are convenience
+defaults, not promises of free access or sufficient research quality. An
+already configured model is preserved when staying on the same endpoint.
+See the [OpenAI model documentation](https://developers.openai.com/api/docs/models/gpt-4.1-mini)
+and [Gemini compatibility documentation](https://ai.google.dev/gemini-api/docs/openai).
 
-```text
+**Advanced** contains manually entered model IDs, the API base URL and optional
+per-activity overrides. There are no provider/model dropdowns or model-list
+requests. For another OpenAI-compatible service (including DeepSeek), configure
+its endpoint/model there, then enter its key with provider `custom`.
+Changing an endpoint clears its old key and activity overrides; a key is never
+silently reused at a different endpoint.
+
+All roles use **one active endpoint and key**, not separate accounts. Blank
+role overrides inherit the research-step model or the literature model, then
+the default model. A configured specialist can develop a selected activity.
+Changing a model name does not enable native web search or a deep-research API.
+
+Settings are **session-only**: page navigation preserves saved settings, but a
+new session or server restart does not. Nothing writes keys to the database or
+`.env`, and opening/saving Settings makes no API request. Reset restores the
+environment configuration. The database connection has its own collapsed section.
+
+For persistent configuration and CLI use, edit `.env` locally:
+
+```dotenv
+DATABASE_URL=postgresql:///research_harness
 LLM_PROVIDER=placeholder
-LLM_API_KEY=
 LLM_MODEL=placeholder-model
+LLM_API_KEY=
 LLM_BASE_URL=https://api.openai.com/v1
+OPENALEX_API_KEY=
 ```
 
-The default `LLM_PROVIDER=placeholder` keeps extraction deterministic and offline. To opt into
-an OpenAI-compatible provider, set `LLM_PROVIDER=openai` (or `openai-compatible`), provide
-`LLM_API_KEY`, select `LLM_MODEL`, and use `--llm` with extraction. Set `LLM_BASE_URL` to an
-OpenAI-compatible `/v1` endpoint for DeepSeek or another compatible service. API keys are never
-printed or written to the database. OpenAlex can be queried without a key for small
-searches; set the optional `OPENALEX_API_KEY` for a higher discovery rate limit.
+Remote CLI configuration uses `LLM_PROVIDER=openai`, `openai-compatible`, or
+`deepseek`, an explicit compatible `LLM_BASE_URL`, model ID and key.
+Without a remote provider, deterministic legacy extraction and local tools
+still work; autonomous research and LLM planning report that they are unavailable.
+The CLI additionally requires `--llm` for those operations.
 
-## Local Dashboard
+Running research sends bounded stored statements, proof notes, outcomes and
+evidence to the configured endpoint. It does not send credentials or arbitrary
+local files as research context. Never commit keys, `.env`, or private logs.
 
-Install the project dependencies, initialize or migrate the database, then start the local
-human-facing dashboard:
+## Literature retrieval: what it actually does
 
-```powershell
-python -m pip install -r requirements.txt
-python -m src.cli init-db
-streamlit run src/gui/app.py
-```
+Literature review is implemented by the harness, not by a model's built-in browser:
 
-The GUI opens on Research Tasks. Create a fixed objective, choose a task, and run a
-user-defined number of autonomous steps. Optionally focus the first step on any existing
-unit, or force a full-text literature survey from that unit. Each successful step creates a
-finished child unit. The database explorer and experiment history remain read-only views.
-Review/approve/reject controls are absent. Existing API keys are never prefilled into widgets.
+1. Try local PDFs already attached to the selected task.
+2. Otherwise query OpenAlex for up to five open-access candidates.
+3. Ask the model to select a relevant source. A unique keyword match may be
+   used when the model returns no selection or fails; that failure is recorded.
+4. Try public HTTPS PDF locations, then open HTML article/main text.
+5. Check source identity, extracted-content hash and review scope against prior
+   successful distillations. Reuse an unchanged distillation and look for a new
+   source; otherwise send extracted text in bounded chunks to the LLM.
+6. Validate structured claims and require an **exact quote** on the supplied
+   page/HTML section before storing anything.
 
-Open **Settings** to configure one active OpenAI-compatible API connection, enter
-a masked API key, change the database connection, and choose models by activity.
-Settings are session-only: they survive page navigation but not a new browser
-session or server restart. They do not overwrite `.env`, write credentials to the
-database, or change other users' sessions. Reset restores the environment defaults.
-Use this credential-entry interface locally; it is not an authenticated public service.
+### Distilled memory and repeat reviews
 
-**Load models from API** makes an explicit metadata request to the active endpoint,
-not a completion. Choose returned model IDs from dropdowns, or enter a custom ID
-if the provider does not offer a compatible model list. No API calls are made just
-by opening Settings. An available model is not necessarily free or suitable for
-structured responses. “Inherit” uses the research model for ordinary activities and
-the literature model for literature substeps; both fall back to the default.
-If a selected activity has a different specialist model, that model develops the
-activity before it is stored. A model ID must be supported by your endpoint;
-entering a name does not enable a provider's web-search or deep-research tools.
+The autonomous literature path stores **distilled findings, not whole papers**:
+self-contained statements, explicit assumptions and limitations, proof/technique
+notes, relevance, and exact supporting excerpts. Theorems, conjectures and open
+problems use their existing tables; reusable ideas use draft derived results.
+Paper rows retain bibliographic metadata and source links. PDFs are processed in
+memory; an attached local PDF remains a file, not a database blob. Evidence records
+retain the source URL/identifier, page or HTML-section location, and a hash of the
+extracted text so a later source revision can be distinguished.
 
-The compact, height-limited unit graph uses numbered circles and thin left-to-right
-connections, with dashed edges for inputs from other branches. Click a circle (or
-focus it and press Enter/Space) to inspect that unit. Colours and the legend identify
-activity types, not verification status. Full titles
-remain in the inspector and the collapsed all-units table. The unit inspector shows the recorded outcome, linked object IDs,
-and models used. A finished activity is not a verified scientific result.
+Repeat intake uses conservative identities:
 
-## Initialize The Database
+- DOI and arXiv aliases match, but explicit arXiv revisions stay distinct.
+  Otherwise, matching requires normalized title, year and authors.
+- Findings match on kind, whitespace-normalized statement, assumptions and
+  limitations. Mathematical case and punctuation are preserved. A stronger bound
+  or changed condition remains a separate finding.
+- The same finding can be reused across tasks and papers through unit links.
+  New citations or supporting passages add evidence; improved proof notes annotate
+  existing evidence instead of inserting duplicate rows. Existing confidence and
+  ownership are preserved.
+- Extraction checkpoints live in timeline events. They apply only to the same
+  source, extracted text, goal/purpose and distillation version. Changed text or
+  purpose is eligible for another extraction; a review with no findings is not
+  marked successfully distilled. Retrieval may still occur to detect revisions.
 
-```powershell
-python -m src.cli init-db
-```
+The extraction model sees bounded task findings. A separate comparison request
+then checks each nonexact new claim against up to six relevant stored findings
+of the same kind, including cross-task findings. Its structured verdict considers
+mathematical scope, assumptions, objectives and bounds. Suggested equivalence is
+saved as `possible_duplicate`; extensions and contradictions retain their target
+reference and explanation. These are **unverified relationships**. A malformed or
+unavailable comparison leaves the supported new claim intact. This can flag
+paraphrases that string matching misses, but it cannot prove mathematical
+equivalence: such claims stay separate until the distinction is resolved. Exact
+matching remains the only automatic merge. No existing rows are deleted or
+retroactively merged. Literature writes and checkpoint creation are transactional,
+with a PostgreSQL advisory lock protecting concurrent intake. This behavior belongs
+to the autonomous literature path; legacy/manual claim insertion is not globally
+deduplicated. No schema migration is required.
 
-This initializes the PostgreSQL schema and shared ontology concepts. It creates no research tasks; specify a task objective explicitly before starting work.
+OpenAlex access is separate from LLM access. `OPENALEX_API_KEY` is optional
+configuration for discovery, not your OpenAI/Gemini key. Access and rate limits
+depend on that service; see [OpenAlex authentication](https://help.openalex.org/api/authentication/).
 
-## Research Tasks And Units
+Downloads can fail because of HTTP access restrictions, DNS/TLS errors, a stale
+URL, no open full text, encrypted/scanned PDFs, or HTML requiring JavaScript.
+A stronger model cannot fix these access problems. Search may also return no
+relevant candidates. The current path is deliberately small: it does not perform
+broad web crawling, bypass paywalls, run OCR, or verify mathematical proofs.
 
-A research task has a fixed name and objective; it is not edited as work progresses.
-A research unit is one activity within that task, such as a literature review, hypothesis
-investigation, proof attempt, or experiment. Units are added as questions arise; a
-`parent_unit_id` records a follow-up branch, while the task timeline remains chronological.
-Unit status describes work progress; a finished unit does not establish a theorem.
-Combining branches adds `uses` links to earlier research units in the same task.
-Those dependencies form an acyclic graph without a separate Git repository or
-new database tables. Research objects remain reusable across tasks.
+PDF limits: 20 MB, 100 pages, 300,000 extracted characters. HTML limits: 2 MB,
+300,000 characters, with sufficient article/main text. Extraction chunks are
+bounded to 18,000 characters; a larger single PDF page is rejected.
+PDF blobs are not stored in PostgreSQL. Local paths, paper metadata, claims,
+proof notes and quoted evidence are stored. Quotes establish attribution, not truth.
+
+Attach your own accessible PDF when remote retrieval is blocked:
 
 ```bash
-python -m src.cli add-research-task --name "Global safety in ATS games" --description "Investigate finite-memory strategies for global safety in three-process ATS games."
-python -m src.cli list-research-tasks
-python -m src.cli add-research-unit --task-id 1 --kind literature_review --title "Survey global safety" --purpose "Find source-backed bounds and assumptions" --status ready
-python -m src.cli next-research-unit --task-id 1
-python -m src.cli list-research-units --task-id 1
-python -m src.cli show-research-unit --unit-id 1
-```
-
-For literature intake, attach a local PDF to a paper record or let an autonomous
-literature step discover openly accessible source text. It reads PDFs or HTML
-article/main text and stores source-attributed claims with exact quotes; it does
-not store PDF blobs in PostgreSQL. HTML locations are text sections, not PDF pages.
-
-```bash
-python -m src.cli add-paper --task-id 1 --title "Example Paper" --authors "A. Author" --year 2026 --pdf-path papers/example.pdf
+python -m src.cli add-paper --task-id 1 --title "Paper title" --authors "A. Author" --year 2026 --pdf-path papers/paper.pdf
 python -m src.cli research-loop --task-id 1 --unit-id 1 --literature-from-unit --steps 1 --llm
 ```
 
-A partial result is stored as a draft `DerivedResult`. It can spawn a proposed
-follow-up unit without implying that the underlying question is solved.
+Use IDs that exist in your database. The forced-survey option requires a unit;
+without one, run a first autonomous step or create a literature unit explicitly.
+
+## Debugging a stopped run
+
+Open **Last run → Error details**. It reports:
+
+- Failing research stage, provider/model/role and validation fields.
+- HTTP status, recognized provider error code, request ID and retry interval
+  when supplied. An unexplained 429 remains ambiguous between rate and quota.
+- A literature trace: local-file attempts, search candidate counts, selection
+  and fallback, download/parse stages, byte/page counts, extraction chunks,
+  quote validation and elapsed times.
+
+Failed runs write an owner-only JSONL record to `data/research_errors.jsonl`,
+linked by diagnostic ID. The CLI returns the same diagnostic context.
+Successful literature runs retain their trace in the unit's timeline event,
+visible under **Models and retrieval details**. These are completed-attempt
+diagnostics, not a live streaming progress display.
 
 ```bash
-python -m src.cli record-unit-result --unit-id 1 --title "Small case" --statement "Observation from the checked fragment" --followup-title "Check larger cases" --followup-purpose "Test whether the observation extends"
-python -m src.cli update-research-unit --unit-id 1 --status finished --outcome-note "Partial result; larger cases remain."
+tail -n 1 data/research_errors.jsonl
 ```
 
-Use `link-research-unit` to attach an existing paper, conjecture, open problem,
-proof attempt, experiment run, or derived result with a relation such as
-`investigates`, `uses`, or `produces`. A unit can reference objects from another
-task as inputs; produced task-scoped objects must belong to its own task.
-The runner can select a promising existing unit or build from `--unit-id`. Literature
-steps search new open-access sources as well as unprocessed local PDFs.
+The log omits prompts, source text, full URLs, raw provider response bodies and
+API keys. File locations in stack traces contain filenames, not stack locals.
+If log writing fails, the GUI reports that no entry was written. Old entries
+cannot be enriched retroactively.
 
-## Papers
+A quota/credit error is not evidence of model weakness; it requires account
+action. A schema-validation error means output failed the contract and was not
+stored. The latest exception is not necessarily a retrieval error—check the stage.
+See [OpenAI error meanings](https://developers.openai.com/api/docs/guides/error-codes).
+Retry counts remain bounded; the diagnostics expose the server's retry interval
+but do not currently change the client's short retry schedule.
 
-```powershell
-python -m src.cli add-paper --title "Example Paper" --authors "A. Author;B. Writer" --year 2026 --venue "Draft" --task-id 1
-python -m src.cli list-papers
-```
+## CLI essentials
 
-## Shared Concepts
-
-```powershell
-python -m src.cli list-concepts
-python -m src.cli add-concept --name "Observation equivalence" --type logic --aliases "obs-eq"
-python -m src.cli link-concepts --source 1 --target 2 --relation related_to
-```
-
-Concepts form a shared ontology; they are not automatically created as research tasks.
-
-## Research Planning
-
-Use a configured LLM to turn a free-form objective into a small, reviewable plan grounded in the stored research state:
-
-```powershell
-python -m src.cli plan-research --goal "Investigate whether finite-memory strategies suffice for global safety in three-process ATS games." --task-id 1 --llm
-```
-
-The command only displays proposed directions. It does not create tasks, persist a plan,
-approve claims, or run experiments.
-
-Without `--llm` and a configured remote provider, the command writes nothing and reports that planning is unavailable.
-
-## Autonomous Research Steps
-
-`research-loop` runs from a fixed task objective. Set `--steps` to the number of
-successful research units to create. The first step may be forced from `--unit-id`;
-later steps select a promising existing unit, so progress may branch. A failed
-provider call, invalid proposal, inaccessible source, or failed transaction stops
-the run and reports the units already completed. A failed literature retrieval or
-quote check also creates a blocked unit with a diagnostic ID, but no claims. It is
-reported separately and does not count as a completed step. Select that unit on a
-later run to retry or develop another direction.
-
-Continuation includes the selected unit's outcome and up to 20 explicitly linked
-research records, with bounded statement, proof-note, evidence and result text,
-in addition to the task snapshot. Running research sends this context to your
-configured LLM endpoint. Credentials and arbitrary local files are not context.
-Each successful unit records contributing provider/model/usage metadata in its
-timeline event, without storing raw prompts or API keys.
+With the virtual environment active:
 
 ```bash
-python -m src.cli research-loop --task-id 1 --steps 10 --llm
-python -m src.cli research-loop --task-id 1 --unit-id 3 --steps 2 --llm
-python -m src.cli research-loop --task-id 1 --unit-id 3 --literature-from-unit --steps 1 --llm
+python -m src.cli --help
+python -m src.cli add-research-task --name "Safety strategies" --description "Investigate finite-memory strategies for global safety."
+python -m src.cli list-research-tasks
+python -m src.cli research-loop --task-id 1 --steps 1 --llm
+python -m src.cli list-research-units --task-id 1
+python -m src.cli show-research-unit --unit-id 1
+python -m src.cli research-loop --task-id 1 --unit-id 1 --steps 2 --llm
 ```
 
-The LLM uses the shared `src/llm.py` provider. It may record analysis, draft
-partial results, provisional conjectures or open problems, draft proof attempts,
-an open-access full-text survey, or the existing tiny bounded ATS/CDM/2DM
-experiment. Only tested checker artifacts may be used for that experiment.
-No model-generated statement is marked verified. Source-reported results are
-working premises with citations and uncertainty; significant conclusions
-depending on them remain draft until a real verification mechanism exists.
+`plan-research --goal "..." --task-id 1 --llm` displays a proposed plan only;
+it does not persist or execute it. Manual unit/link/result, concept, paper,
+conjecture and research-map commands remain available; use command-specific
+`--help` for their arguments.
 
-Literature discovery uses OpenAlex metadata across publishers and repositories,
-then reads directly available public HTTPS PDFs, with open HTML article/main text
-as a fallback. Every fallback paper undergoes relevance selection. It also reads
-unprocessed local PDFs already attached to a task. PDF bytes are not stored in
-PostgreSQL. The extractor requires an exact quote from an extracted page or HTML
-text section before inserting a
-source-reported theorem, conjecture, or open problem. It does not bypass
-paywalls, perform OCR, or verify mathematical correctness. Limits are 20 MB,
-100 pages, and 300,000 extracted characters per PDF. HTML downloads are limited to
-2 MB and 300,000 extracted characters. Some publisher pages expose only abstracts
-or require JavaScript; this is not universal full-text access, and quotations prove
-source attribution, not the truth or completeness of a claim. Failed downloads
-include safe host/error details in the GUI and private local diagnostic log.
+The deterministic experiment layer supports tiny ATS/CDM/2DM safety games:
 
-### Failure diagnostics
-
-Failed research runs display a diagnostic ID and details in **Last run → Error
-details**, also returned by `research-loop`. The private, owner-only log is
-`data/research_errors.jsonl`. Each entry includes the UTC time, task/step,
-research stage, parent unit, and stack locations. LLM failures also include
-provider, selected model/role, endpoint host, HTTP status, recognized error code,
-request ID and retry interval when supplied, attempt history and elapsed time.
-Known quota errors are distinguished from rate limiting; an unexplained 429 is
-explicitly labeled ambiguous. Validation errors retain field names and schema
-name, not model output. Literature failures retain their reason and safe download
-details. If writing the local log fails, the GUI says no entry was written.
-
-Raw provider error messages/bodies, prompts, responses, authorization headers,
-full endpoint URLs and API keys are not logged. Only recognized error codes and
-types are retained, so an unknown provider reason may remain unspecified. GUI
-session keys are protected as well as environment keys. These diagnostics do not
-change retry policy or research behavior, and cannot recover details discarded
-by older log entries.
-
-## Legacy Extraction
-
-`extract-from-text` and `extract-from-pdf` remain available for compatibility.
-They write candidates to the old pending table, not to the autonomous task
-memory. The review commands and GUI approval view are no longer exposed.
-Use autonomous full-text literature steps for the new workflow.
-
-## Literature Research Demo
-
-Run the local vertical-slice literature workflow from approved seed artifacts:
-
-```powershell
-python -m src.cli research-demo --dry-run
-python -m src.cli query-literature --topic-id 1 --question "What is known about global safety in CDM or ATS games?"
-python -m src.cli research-memo --topic-id 1 --question "Does causal ordering in two-decision-maker ATS/CDM games plausibly recover decidability for distributed safety synthesis?"
-python -m src.cli research-memo --topic-id 1 --question "Does causal ordering in two-decision-maker ATS/CDM games plausibly recover decidability for distributed safety synthesis?" --llm
-python -m src.cli quality-check-literature --topic-id 1
-python -m src.cli generate-verification-tasks --topic-id 1
+```bash
+python -m src.cli generate-game --kind ATS --processes 2 --states 2 --seed 7 --output generated/games/tiny.json
+python -m src.cli brute-check --input generated/games/tiny.json --depth 5
 ```
 
-The demo creates a research topic for causally ordered two-decision-maker ATS/CDM safety synthesis, loads local approved seed JSON files from `results/approved/`, stores literature notes and summaries in PostgreSQL, links evidence spans, and writes `results/literature/demo_literature_map.md`.
+Autonomous experiment steps can use only the existing trusted, tested checker
+artifact under explicit bounds. Manual `register-code-artifact` and
+`run-experiment` commands record paths, commands, Git revisions, outputs and
+summaries; the latter executes the command you explicitly supply.
+A bounded observation is not an unbounded theorem.
 
-`research-memo` writes `results/literature/topic_<id>_research_memo.md` from stored evidence only. New conjectures are labelled as conjectures, and unsupported points are labelled `needs verification`.
+## Code and data map
 
-`quality-check-literature` writes a local quality report for the notes, summaries, evidence spans, map, memo, and query robustness checks. `generate-verification-tasks` writes literature/theory checking tasks; it does not suggest experiments.
+| Area | Responsibility |
+| --- | --- |
+| `src/gui/app.py`, `settings.py`, `unit_graph.py` | GUI, session settings, selectable unit graph |
+| `src/cli.py`, `dashboard.py` | CLI entry point and GUI-facing application functions |
+| `src/autonomous_research.py` | Current bounded research runner |
+| `src/research_context.py`, `research_actions.py`, `research_units.py` | Scoped context, trusted actions and unit links/results |
+| `src/llm.py` | Shared provider, model routing, bounded retries and Pydantic response validation |
+| `src/literature/discovery.py` | OpenAlex discovery, PDF/HTML reading, grounded extraction and trace |
+| `src/literature/identity.py`, `memory.py` | Conservative identities, distilled findings, evidence and repeat-review checkpoints |
+| `src/db.py`, `schemas.py` | PostgreSQL tables, migrations, queries and Pydantic data objects |
+| `src/experiments/`, `brute_solver.py`, `models.py` | Implemented small-game models, generation and checkers |
+| `src/code_artifacts.py`, `experiment_manager.py`, `git_utils.py` | Artifact and experiment provenance |
+| `src/research_planning.py` | Display-only research-plan generation |
+| `scripts/`, `docker-compose.yml` | Explicit PostgreSQL provisioning |
+| `tests/` | Database, workflow, adversarial, GUI and checker tests |
+| `papers/`, `generated/`, `results/`, `data/` | Local sources, generated files, results and diagnostics |
 
-No new theorem-like claim is inserted into approved theorem tables by the demo. The report uses stored seed material and marks unresolved points as needing verification. See [docs/literature_workflow.md](docs/literature_workflow.md).
+PostgreSQL stores tasks, units, unit/object links, papers, concepts, theorems,
+conjectures, open problems, reductions, proof attempts, evidence, derived results,
+code/experiment metadata and timeline events. Code and generated files stay on
+disk; Git revisions provide code provenance. Empty library/experiment directories
+are scaffolding, not implemented solver families.
 
-## Research Map Queries
+### Legacy tools
 
-```powershell
-python -m src.cli theorems-by-task 1
-python -m src.cli theorems-by-model "ATS games"
-python -m src.cli theorems-by-objective safety
-python -m src.cli open-problems-by-task 1
-python -m src.cli show-research-map
-```
-
-`show-research-map` prints research tasks, key papers, key theorems, known upper/lower bounds, open gaps, and candidate conjectures.
-
-## Conjectures
-
-```powershell
-python -m src.cli add-conjecture --statement "Every bounded-memory controller for this fragment has a finite-state normal form." --task-id 1 --attack-plan "Search tiny counterexamples first."
-python -m src.cli list-conjectures
-python -m src.cli show-conjecture 1
-python -m src.cli update-conjecture-status 1 --status paused
-```
-
-## Experiments
-
-The current experiment plugin supports tiny ATS/CDM/2DM safety games. The layout is intentionally modular:
-
-```text
-src/experiments/
-  ats_models.py
-  ats_generator.py
-  ats_brute_solver.py
-```
-
-Later experiment plugins can add Petri game toy generation, graph game solvers, parity game solvers, or trace automata experiments.
-
-Generate a tiny game:
-
-```powershell
-python -m src.cli generate-game --kind ATS --processes 3 --states 2 --seed 7 --output data/tiny_game.json
-```
-
-Run the bounded brute checker:
-
-```powershell
-python -m src.cli brute-check --input data/tiny_game.json --depth 5
-```
-
-## Code And Experiment Management
-
-Research claims live in the database. Code lives in Git. Experiment metadata links them.
-
-Reusable implementation code should live under `src/libraries/`, `src/experiments/`, or ordinary Git-tracked experiment scripts. PostgreSQL stores artifact metadata, command lines, result summaries, input/output paths, and git commit hashes. It does not store source-code blobs.
-
-The repository includes these long-term code and output areas:
-
-```text
-src/libraries/
-  ats/
-  graph_games/
-  reductions/
-  search/
-experiments/
-  restricted_2dm/
-  reachability_gap/
-  logical_characterization/
-generated/
-  games/
-  counterexamples/
-results/
-```
-
-Register the current ATS brute checker as a code artifact:
-
-```powershell
-python -m src.cli register-code-artifact --name "ATS brute checker" --path "src/experiments/ats_brute_solver.py" --artifact-type checker --tests-path "tests/test_brute_solver.py" --related-concepts "ATS games;safety objective"
-python -m src.cli list-code-artifacts
-python -m src.cli show-code-artifact --artifact-id 1
-```
-
-Generate a tiny input game and run the checker as a recorded experiment:
-
-```powershell
-python -m src.cli generate-game --kind ATS --processes 2 --states 2 --seed 1 --output generated/games/tiny_ats.json
-python -m src.cli run-experiment --artifact-id 1 --command "python -m src.cli brute-check --input generated/games/tiny_ats.json --depth 5" --input-path generated/games/tiny_ats.json --experiment-type ats_bounded_safety --conjecture-id 1
-python -m src.cli list-experiment-runs
-python -m src.cli show-experiment-run --run-id 1
-```
-
-Stdout and stderr are written to a timestamped file under `results/`. Previous result files are never deleted by the runner.
-
-## Week-One Seed Assets
-
-The repository includes seed prompt files under `prompts/` and approval JSON templates under `results/approved/` for an initial LICS-style literature spine:
-
-- restricted ATS/CDM/2DM synthesis
-- global objectives in causal-memory games
-- acyclic architectures and automata-theoretic transfers
-
-The ordered-2DM conjecture loop has a small driver at:
-
-```text
-experiments/restricted_2dm/run_tiny_ordered_2dm_search.py
-```
-
-Run it through the experiment manager:
-
-```powershell
-python -m src.cli run-experiment --artifact-id 1 --task-id 1 --conjecture-id 1 --command "python experiments/restricted_2dm/run_tiny_ordered_2dm_search.py --instances 200 --max-processes 3 --max-local-states 3 --objective safety --output results/ordered_2dm_tiny_search.json"
-```
-
-Run one bounded pipeline step:
-
-```powershell
-python -m src.cli run-pipeline --task-id 1 --mode literature
-python -m src.cli run-pipeline --task-id 1 --mode experiments
-```
+`src/extract.py`, `curate.py`, `ingest.py`, `orchestrator.py`,
+`research_controller.py`, `research_policy.py`, and
+`src/literature/demo.py` retain older workflows. They are not the GUI's
+autonomous runner. Legacy extraction writes pending entries; the manual
+`run-pipeline` is not equivalent to `research-loop`. The seed literature demo
+uses separate topic/note/summary records, not autonomous discovery.
+See [the legacy literature workflow](docs/literature_workflow.md).
+No legacy approval controls are exposed by the current GUI or CLI.
 
 ## Tests
 
-Tests use a real PostgreSQL server with temporary schemas, but fake LLM and
-discovery responses; they do not require paid provider calls. Export
-`TEST_DATABASE_URL` for a non-production database. On Linux/macOS, disable loading
-your live `.env` so it cannot override offline test assumptions:
+Tests use a real local PostgreSQL server with temporary, automatically removed
+schemas and fake LLM/discovery responses. They do not require paid API calls.
+Set `TEST_DATABASE_URL` to a **non-production** database before running;
+otherwise the tests use `DATABASE_URL`/the local default.
 
 ```bash
 PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m pytest -q
 ```
+
+Disabling dotenv keeps live API settings out of offline test assumptions.
+On PowerShell, set `$env:PYTHON_DOTENV_DISABLED="1"` before running pytest.

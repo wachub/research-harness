@@ -15,12 +15,13 @@ from pydantic import Field, model_validator
 
 from . import db
 from .literature.discovery import LiteratureError, discover_full_text, extract_source_claims
+from .literature.memory import compare_with_existing, completed_ingestion, existing_findings, review_scope, store_distillation
 from .llm import LLMClient, LLMError, LLMMessage, LLMRequest
 from .research_actions import BoundedExperimentParameters, ResearchReference, get_trusted_artifact, run_trusted_bounded_experiment
 from .research_context import load_controller_context, validate_context_reference
 from .schemas import (
-    Conjecture, DerivedResult, EvidenceSpan, OpenProblem, Paper, ProofAttempt,
-    ResearchEvent, ResearchUnit, ResearchUnitLink, StrictBase, Theorem,
+    Conjecture, DerivedResult, OpenProblem, ProofAttempt,
+    ResearchEvent, ResearchUnit, ResearchUnitLink, StrictBase,
 )
 
 
@@ -251,6 +252,7 @@ class AutonomousResearch:
     def _execute(self, task_id: int, parent_id: int | None, proposal: StepProposal) -> int:
         # All model-supplied IDs were checked against the bounded task snapshot.
         produced: list[tuple[str, int]] = []
+        survey_links: list[tuple[str, int, str]] = []
         outcome = proposal.outcome
         survey = self._survey(task_id, proposal) if proposal.kind == "literature_review" else None
         if proposal.kind == "bounded_experiment":
@@ -259,7 +261,7 @@ class AutonomousResearch:
         with db.get_connection(self.db_path) as connection:
             db.create_tables(connection)
             if survey is not None:
-                produced, outcome = self._store_survey(connection, task_id, survey)
+                survey_links, outcome = self._store_survey(connection, task_id, survey)
             if proposal.kind == "bounded_experiment":
                 assert proposal.experiment is not None
                 run = run_trusted_bounded_experiment(
@@ -318,12 +320,17 @@ class AutonomousResearch:
                 db.link_research_unit(connection, ResearchUnitLink(
                     unit_id=unit_id, relation="produces", object_type=kind, object_id=object_id,
                 ))
+            for kind, object_id, relation in survey_links:
+                db.link_research_unit(connection, ResearchUnitLink(
+                    unit_id=unit_id, relation=relation, object_type=kind, object_id=object_id,
+                ))
             db.insert_research_event(connection, ResearchEvent(
                 task_id=task_id, event_type="research_step_completed",
                 object_type="research_unit", object_id=unit_id,
                 summary=f"Completed {proposal.kind}: {proposal.title}",
                 metadata={"models": list(self.client.call_metadata),
-                          "rationale": proposal.rationale},
+                          "rationale": proposal.rationale,
+                          **({"literature": survey[0].diagnostics} if survey is not None else {})},
             ))
             return unit_id
 
@@ -331,61 +338,45 @@ class AutonomousResearch:
         with db.get_connection(self.db_path) as connection:
             stored = db.list_papers(connection, task_id=task_id)
             task = db.get_task(connection, task_id)
-        query = f"{task.name if task else ''} {task.description if task else ''} {proposal.purpose}".strip()
+            findings = existing_findings(connection, task_id)
+        goal = task.description or task.name
+        scope = review_scope(goal, proposal.purpose)
+        query = f"{task.name} {goal} {proposal.purpose}".strip()
         local = [
             (paper.title, paper.pdf_path, tuple(paper.authors), paper.year, paper.url or "")
-            for paper in stored if paper.pdf_path and not (paper.notes or "").startswith("Full text read;")
+            for paper in stored if paper.pdf_path
         ]
-        excluded = {(paper.title, paper.year) for paper in stored if (paper.notes or "").startswith("Full text read;")}
-        paper = discover_full_text(query, local, excluded, self.client)
-        claims = extract_source_claims(self.client, paper, query)
-        return paper, claims
+        excluded_keys: set[str] = set()
+        reused_paper = None
+        # Read up to the five remote candidates plus attached local sources.
+        # Compare exact source content/scope before paying to extract it again.
+        for _ in range(len(local) + 5):
+            try:
+                paper = discover_full_text(query, local, set(), self.client, excluded_keys)
+            except LiteratureError as exc:
+                if reused_paper is not None and exc.diagnostics.get("category") == "no_search_candidates":
+                    reused_paper.diagnostics["discovery_after_reuse"] = exc.diagnostics
+                    return reused_paper, []
+                raise
+            paper.diagnostics["review_scope"] = scope
+            with db.get_connection(self.db_path) as connection:
+                prior = completed_ingestion(connection, paper, scope)
+            if prior:
+                reused_paper = paper
+                if not paper.discovery_key or paper.discovery_key in excluded_keys:
+                    return paper, []
+                excluded_keys.add(paper.discovery_key)
+                continue
+            claims = extract_source_claims(self.client, paper, query, findings)
+            with db.get_connection(self.db_path) as connection:
+                claims = compare_with_existing(connection, task_id, self.client, paper, claims)
+            return paper, claims
+        if reused_paper is not None:
+            return reused_paper, []
+        raise LiteratureError("No new sources found within the review limit")
 
-    def _store_survey(self, connection, task_id: int, survey) -> tuple[list[tuple[str, int]], str]:
-        paper, claims = survey
-        produced: list[tuple[str, int]] = []
-        paper_id = db.insert_paper(connection, Paper(
-            title=paper.title, authors=list(paper.authors), year=paper.year,
-            venue=paper.venue, pdf_path=paper.local_path, url=paper.pdf_url or paper.url,
-            notes=f"Full text read; source record: {paper.url}. Extracted claims are source-reported and unverified.",
-            task_id=task_id,
-        ))
-        produced.append(("paper", paper_id))
-        for claim in claims:
-            location = f"p. {claim.page}" if paper.text_format == "pdf" else f"HTML text section {claim.page}"
-            if claim.kind == "theorem":
-                object_type = "theorem"
-                object_id = db.insert_theorem(connection, Theorem(
-                    title=claim.title, statement=claim.statement,
-                    source_paper_id=paper_id, source_location=location,
-                    proof_technique=claim.proof_note, confidence="pending",
-                    task_id=task_id, notes="Source-reported; not independently verified.",
-                ))
-            elif claim.kind == "open_problem":
-                object_type = "open_problem"
-                object_id = db.insert_open_problem(connection, OpenProblem(
-                    title=claim.title, statement=claim.statement,
-                    source_paper_id=paper_id, source_location=location,
-                    task_id=task_id, status="active",
-                    notes="Source-reported; not independently verified.",
-                ))
-            else:
-                object_type = "conjecture"
-                object_id = db.insert_conjecture(connection, Conjecture(
-                    title=claim.title, statement=claim.statement,
-                    task_id=task_id, confidence="needs_review", status="active",
-                    notes=f"Source-reported from paper {paper_id}, {location}: {claim.quote}",
-                ))
-            produced.append((object_type, object_id))
-            evidence_id = db.insert_evidence_span(connection, EvidenceSpan(
-                paper_id=paper_id, entry_type=object_type, entry_id=object_id,
-                page_start=claim.page if paper.text_format == "pdf" else None,
-                page_end=claim.page if paper.text_format == "pdf" else None,
-                notes=location,
-                quote_or_summary=claim.quote, confidence="pending",
-            ))
-            produced.append(("evidence", evidence_id))
-        return produced, f"Read {len(paper.pages)} {paper.text_format} pages/sections from {paper.title}; stored {len(claims)} source-reported, unverified claims."
+    def _store_survey(self, connection, task_id: int, survey):
+        return store_distillation(connection, task_id, *survey)
 
 
 DIAGNOSTIC_LOG = Path(__file__).resolve().parents[1] / "data" / "research_errors.jsonl"

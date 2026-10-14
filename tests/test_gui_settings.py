@@ -1,15 +1,12 @@
 """GUI-only settings tests: no real credentials, LLM calls or literature access."""
 
-import io
-import json
 import os
-import urllib.error
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
 from src import dashboard, db
-from src.gui.settings import load_model_ids, validate_endpoint
+from src.gui.settings import configure_provider, provider_label, validate_endpoint
 from src.llm import LLMConfiguration
 from src.schemas import ResearchTask, ResearchUnit
 
@@ -48,10 +45,9 @@ def test_session_key_survives_navigation_and_is_used_only_for_runs(app, monkeypa
         return {"status": "completed", "message": "Done", "research_unit_ids": []}
     monkeypatch.setattr(dashboard, "run_research_steps", run)
     app.radio[0].set_value("Settings").run(timeout=10)
-    widget(app, "selectbox", "settings_api_mode").set_value("OpenAI-compatible API")
-    widget(app, "text_input", "settings_api_url").set_value("https://example.org/v1")
+    widget(app, "text_input", "settings_provider").set_value("OpenAI")
     widget(app, "text_input", "settings_api_key").set_value("fake-session-secret")
-    button(app, "Apply connection").click().run(timeout=10)
+    button(app, "Save API settings").click().run(timeout=10)
     assert not app.exception
     assert widget(app, "text_input", "settings_api_key").value == ""
     assert "LLM_API_KEY" not in os.environ
@@ -60,16 +56,16 @@ def test_session_key_survives_navigation_and_is_used_only_for_runs(app, monkeypa
     assert not app.exception
     widget(app, "button", "continue_research").click().run(timeout=10)
     assert calls[0].configuration.api_key == "fake-session-secret"
-    assert calls[0].configuration.base_url == "https://example.org/v1"
+    assert calls[0].configuration.base_url == "https://api.openai.com/v1"
     app.radio[0].set_value("System Status").run(timeout=10)
     assert all("fake-session-secret" not in str(item.value) for item in app.json)
     app.radio[0].set_value("Settings").run(timeout=10)
     assert widget(app, "text_input", "settings_api_key").value == ""
     # A new endpoint must not silently inherit the previous endpoint's key.
-    widget(app, "text_input", "settings_api_url").set_value("https://different.example/v1")
-    button(app, "Apply connection").click().run(timeout=10)
+    widget(app, "text_input", "settings_provider").set_value("Gemini")
+    button(app, "Save API settings").click().run(timeout=10)
     assert any("Enter a key" in item.value for item in app.error)
-    assert app.session_state["api_configuration"].base_url == "https://example.org/v1"
+    assert app.session_state["api_configuration"].base_url == "https://api.openai.com/v1"
     widget(app, "button", "reset_settings").click().run(timeout=10)
     assert not app.exception
     assert "api_configuration" not in app.session_state
@@ -112,28 +108,51 @@ def test_graph_click_updates_only_inspector(app, monkeypatch):
     assert widget(app, "selectbox", "inspect_unit_1").value == unit_id
 
 
-def test_model_catalog_request_is_explicit_and_bounded(monkeypatch):
-    requests = []
-    class Opener:
-        def open(self, request, timeout):
-            requests.append((request, timeout))
-            return io.BytesIO(json.dumps({"data": [{"id": "b"}, {"id": "a"}, {"id": "a"}]}).encode())
-    monkeypatch.setattr("src.gui.settings.urllib.request.build_opener", lambda *_: Opener())
-    configuration = LLMConfiguration(provider="openai-compatible", api_key="fake", base_url="https://example.org/v1")
-    assert load_model_ids(configuration) == ["a", "b"]
-    assert requests[0][0].full_url == "https://example.org/v1/models"
-    assert requests[0][0].get_method() == "GET"
-    assert requests[0][1] == 15
+def test_settings_have_no_model_or_provider_dropdowns_or_network_calls(app, monkeypatch):
+    def no_network(*args, **kwargs):
+        raise AssertionError("Settings must not call the API")
+    monkeypatch.setattr("urllib.request.urlopen", no_network)
+    app.radio[0].set_value("Settings").run(timeout=10)
+    assert not app.selectbox
+    assert not any("Load models" in item.label for item in app.button)
+    assert any(item.label.startswith("Advanced:") and not item.proto.expanded for item in app.expander)
+    widget(app, "text_input", "settings_provider").set_value("Gemini")
+    widget(app, "text_input", "settings_api_key").set_value("fake-secret")
+    button(app, "Save API settings").click().run(timeout=10)
+    assert not app.exception
+    assert app.session_state["api_configuration"].model == "gemini-2.5-flash"
 
 
-def test_model_catalog_errors_do_not_echo_credentials(monkeypatch):
-    class Opener:
-        def open(self, request, timeout):
-            raise urllib.error.HTTPError(request.full_url, 401, "fake-secret", {}, None)
-    monkeypatch.setattr("src.gui.settings.urllib.request.build_opener", lambda *_: Opener())
-    with pytest.raises(ValueError, match="HTTP 401") as error:
-        load_model_ids(LLMConfiguration(provider="openai", api_key="fake-secret"))
-    assert "fake-secret" not in str(error.value)
+def test_custom_endpoint_clears_key_and_routes(app):
+    app.radio[0].set_value("Settings").run(timeout=10)
+    widget(app, "text_input", "settings_provider").set_value("OpenAI")
+    widget(app, "text_input", "settings_api_key").set_value("old-secret")
+    button(app, "Save API settings").click().run(timeout=10)
+    widget(app, "text_input", "settings_model_proof_attempt").set_value("proof-model")
+    widget(app, "text_input", "settings_api_url").set_value("https://example.org/v1")
+    widget(app, "text_input", "settings_model_default").set_value("custom-model")
+    button(app, "Apply advanced settings").click().run(timeout=10)
+    assert not app.exception
+    assert app.session_state["api_configuration"].api_key == ""
+    assert app.session_state["model_routes"] == {}
+    assert widget(app, "text_input", "settings_provider").value == "custom"
+    assert widget(app, "text_input", "settings_model_proof_attempt").value == ""
+    widget(app, "text_input", "settings_api_key").set_value("new-secret")
+    button(app, "Save API settings").click().run(timeout=10)
+    assert not app.exception
+    assert app.session_state["api_configuration"].model == "custom-model"
+    assert app.session_state["api_configuration"].api_key == "new-secret"
+
+
+def test_provider_settings_preserve_same_endpoint_model_and_reject_unknown_names():
+    config = LLMConfiguration("openai", "chosen-model", "old-secret")
+    assert configure_provider(" OpenAI ", "", config) == LLMConfiguration("openai-compatible", "chosen-model", "old-secret")
+    assert configure_provider("offline", "", config).api_key == ""
+    assert provider_label(config) == "openai"
+    with pytest.raises(ValueError, match="Enter a key"):
+        configure_provider("Gemini", "", config)
+    with pytest.raises(ValueError, match="Enter OpenAI"):
+        configure_provider("unknown-provider", "new-secret", config)
 
 
 @pytest.mark.parametrize("url", ["http://example.org/v1", "https://user:secret@example.org", "https://example.org?key=secret"])

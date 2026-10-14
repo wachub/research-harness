@@ -891,12 +891,11 @@ def list_concept_links(connection: PostgresConnection) -> list[ConceptLink]:
 def insert_paper(connection: PostgresConnection, paper: Paper) -> int:
     """Insert a paper and return its id."""
 
-    existing = connection.execute(
-        "SELECT id FROM papers WHERE title = ? AND year = ? ORDER BY id LIMIT 1",
-        (paper.title, paper.year),
-    ).fetchone()
+    # Serialize lookup + insert, including concurrent literature and manual intake.
+    connection.execute("SELECT pg_advisory_xact_lock(6823101)")
+    existing = find_matching_paper(connection, paper)
     if existing:
-        return int(existing["id"])
+        return existing.id
 
     connection.execute(
         """
@@ -924,6 +923,12 @@ def insert_paper(connection: PostgresConnection, paper: Paper) -> int:
         f"Added paper: {paper.title}",
     )
     return paper_id
+
+
+def find_matching_paper(connection: PostgresConnection, paper: Paper) -> Paper | None:
+    from .literature.identity import same_paper
+
+    return next((item for item in list_papers(connection) if same_paper(item, paper)), None)
 
 
 def list_papers(connection: PostgresConnection, task_id: int | None = None) -> list[Paper]:

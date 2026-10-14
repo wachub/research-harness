@@ -131,7 +131,7 @@ def _projects_view(db_path: str, model_overrides: dict[str, str] | None = None) 
         st.text(inspected.get("outcome_note") or "No outcome recorded yet.")
         with st.expander("Linked inputs and outputs"):
             st.json(detail["research_unit_links"].get(str(inspected_id), []))
-        with st.expander("Models used"):
+        with st.expander("Models and retrieval details"):
             events = dashboard.project_timeline(selected_id, db_path)
             for event in events:
                 if (event.get("event_type") == "research_step_completed"
@@ -210,8 +210,11 @@ def _show_task_action(last_action: dict[str, Any]) -> None:
             diagnostics = output.get("diagnostics", {})
             if diagnostics.get("hint"):
                 st.info(diagnostics["hint"])
+            if trace := diagnostics.get("literature_trace"):
+                st.caption("Literature stages (no source text or full URLs)")
+                st.dataframe(trace, hide_index=True, width="stretch")
             if diagnostics:
-                st.json(diagnostics)
+                st.json({key: value for key, value in diagnostics.items() if key != "literature_trace"})
             if output.get("error_details"):
                 st.json(output["error_details"])
             if output.get("diagnostic_id"):

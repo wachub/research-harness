@@ -176,8 +176,11 @@ def test_html_fallback_is_grounded_and_stored_without_fake_page_numbers(state, m
     assert result.status == "completed"
     with db.get_connection(path) as connection:
         evidence = db.list_evidence_spans(connection)[0]
-        assert evidence.page_start is None and evidence.notes == "HTML text section 1"
+        assert evidence.page_start is None and json.loads(evidence.notes)["location"] == "HTML text section 1"
         assert db.list_theorems(connection, task_id)[0].source_location == "HTML text section 1"
+        event = next(event for event in db.list_research_events(connection, task_id)
+                     if event.event_type == "research_step_completed")
+        assert event.metadata["literature"]["literature_trace"][-1]["stage"] == "validate_quotes"
 
 
 def test_inaccessible_relevant_paper_does_not_allow_irrelevant_fallback(monkeypatch):
@@ -218,10 +221,8 @@ def test_gui_inspector_and_model_routing(state, monkeypatch):
     assert not app.exception
     assert any("Earlier partial argument" in item.value for item in app.text)
     app.radio[0].set_value("Settings").run(timeout=10)
-    app.session_state["model_catalog"] = ["reasoner"]
-    app.run(timeout=10)
-    next(item for item in app.selectbox if item.key == "settings_model_proof_attempt").set_value("reasoner")
-    next(item for item in app.button if item.label == "Apply models").click().run(timeout=10)
+    next(item for item in app.text_input if item.key == "settings_model_proof_attempt").set_value("reasoner")
+    next(item for item in app.button if item.label == "Apply advanced settings").click().run(timeout=10)
     app.radio[0].set_value("Research Tasks").run(timeout=10)
     next(item for item in app.button if item.key == "continue_research").click()
     app.run(timeout=10)
