@@ -1,6 +1,5 @@
 from src import db
-from src.curate import approve_pending
-from src.schemas import Paper, PendingEntry
+from src.schemas import Paper
 
 
 def test_database_inserts_paper(tmp_path):
@@ -25,35 +24,18 @@ def test_database_inserts_paper(tmp_path):
     assert papers[0].authors == ["A. Author"]
 
 
-def test_pending_approval_writes_to_theorems(tmp_path):
+def test_historical_pending_rows_remain_readable_without_approval_api(tmp_path):
     db_path = tmp_path / "research.db"
     db.initialize_database(db_path)
 
     with db.get_connection(db_path) as connection:
-        pending_id = db.insert_pending_entry(
-            connection,
-            PendingEntry(
-                entry_type="theorem",
-                payload={
-                    "title": "Safety theorem",
-                    "statement": "All reachable states are safe.",
-                    "assumptions": ["finite game"],
-                    "conclusion": "safety holds",
-                    "paper_id": None,
-                    "tags": ["safety"],
-                },
-            ),
+        connection.execute(
+            "INSERT INTO pending_entries (entry_type, payload_json, warnings_json) VALUES (?, ?, ?)",
+            ("theorem", '{"statement":"Historical candidate"}', "[]"),
         )
-
-    result = approve_pending(pending_id, db_path=db_path)
-
-    with db.get_connection(db_path) as connection:
+        pending = db.list_pending_entries(connection)
         theorems = db.list_theorems(connection)
-        pending = db.get_pending_entry(connection, pending_id)
-
-    assert result.inserted_table == "theorems"
-    assert len(theorems) == 1
-    assert theorems[0].title == "Safety theorem"
-    assert pending is not None
-    assert pending.status == "approved"
+    assert len(pending) == 1 and pending[0].payload["statement"] == "Historical candidate"
+    assert theorems == []
+    assert not hasattr(db, "update_pending_status")
 

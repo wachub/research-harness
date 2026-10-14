@@ -32,7 +32,7 @@ before any unit is created.
 **Finished activity does not mean established result.** Model outputs are drafts
 or unverified. Source-reported claims retain citations and exact evidence quotes.
 They may be working premises, but no general proof verifier exists and the LLM
-cannot mark them verified. The GUI and CLI have no approve/reject review controls.
+cannot mark them verified. No result waits for human approval before storage.
 
 ## Quick start
 
@@ -248,16 +248,24 @@ Open **Last run → Error details**. It reports:
 
 Failed runs write an owner-only JSONL record to `data/research_errors.jsonl`,
 linked by diagnostic ID. The CLI returns the same diagnostic context.
+Each failure includes the completed research-stage sequence and elapsed time per
+stage, the stage that failed, IDs of units completed earlier in that run, and
+bounded model-call metadata (role, model, token counts and elapsed time).
 Successful literature runs retain their trace in the unit's timeline event,
 visible under **Models and retrieval details**. These are completed-attempt
 diagnostics, not a live streaming progress display.
+Literature comparison diagnostics show each bounded batch's size, timing and
+safe failure category, including when the comparison failed but grounded claims
+were still stored.
 
 ```bash
 tail -n 1 data/research_errors.jsonl
 ```
 
 The log omits prompts, source text, full URLs, raw provider response bodies and
-API keys. File locations in stack traces contain filenames, not stack locals.
+API keys. Unrecognized diagnostic fields are omitted; trace lists are bounded.
+Existing log files are forced to owner-only permissions, and symlink targets
+are not followed. File locations in stack traces contain filenames, not stack locals.
 If log writing fails, the GUI reports that no entry was written. Old entries
 cannot be enriched retroactively.
 
@@ -282,8 +290,7 @@ python -m src.cli show-research-unit --unit-id 1
 python -m src.cli research-loop --task-id 1 --unit-id 1 --steps 2 --llm
 ```
 
-`plan-research --goal "..." --task-id 1 --llm` displays a proposed plan only;
-it does not persist or execute it. Manual unit/link/result, concept, paper,
+Manual unit/link/result, concept, paper,
 conjecture and research-map commands remain available; use command-specific
 `--help` for their arguments.
 
@@ -325,16 +332,13 @@ code/experiment metadata and timeline events. Code and generated files stay on
 disk; Git revisions provide code provenance. Empty library/experiment directories
 are scaffolding, not implemented solver families.
 
-### Legacy tools
+### Historical data and seed demo
 
-`src/extract.py`, `curate.py`, `ingest.py`, `orchestrator.py`,
-`research_controller.py`, `research_policy.py`, and
-`src/literature/demo.py` retain older workflows. They are not the GUI's
-autonomous runner. Legacy extraction writes pending entries; the manual
-`run-pipeline` is not equivalent to `research-loop`. The seed literature demo
-uses separate topic/note/summary records, not autonomous discovery.
-See [the legacy literature workflow](docs/literature_workflow.md).
-No legacy approval controls are exposed by the current GUI or CLI.
+The old pending-entry table remains readable so existing database rows are not
+lost, but no supported command creates, approves, rejects, or flags entries.
+The former manual extraction/curation pipeline and interactive controller have
+been retired. The separate seed literature demo uses topic/note/summary records,
+not autonomous discovery; see [the seed workflow](docs/literature_workflow.md).
 
 ## Tests
 

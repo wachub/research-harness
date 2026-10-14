@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Literal
 from typing import Any
 
 from pydantic import Field, model_validator
 
 from .. import db
-from ..llm import LLMClient, LLMError, LLMMessage, LLMRequest
+from ..llm import LLMClient, LLMError, LLMMessage, LLMRequest, safe_error_metadata
 from ..schemas import Conjecture, DerivedResult, EvidenceSpan, OpenProblem, Paper, ResearchEvent, StrictBase, Theorem
 from .discovery import FullTextPaper, SourceClaim, SourceQuote
 from .identity import digest, normalized_text, source_identifier
@@ -181,13 +182,14 @@ def compare_with_existing(connection, task_id: int, client: LLMClient,
         paper.diagnostics["semantic_comparison"] = {"offered": 0, "flagged": 0}
         return claims
 
-    diagnostics = {"offered": len(requests), "flagged": 0, "failed_batches": 0}
+    diagnostics = {"offered": len(requests), "flagged": 0, "failed_batches": 0, "batches": []}
     paper.diagnostics["semantic_comparison"] = diagnostics
     result = list(claims)
     flagged = 0
     for start in range(0, len(requests), MAX_COMPARISON_BATCH):
         batch = requests[start:start + MAX_COMPARISON_BATCH]
         batch_ids = {item["claim_index"] for item in batch}
+        batch_started = time.monotonic()
         try:
             response = client.complete_json(LLMRequest(
                 messages=(
@@ -212,11 +214,19 @@ def compare_with_existing(connection, task_id: int, client: LLMClient,
             # A weak provider must not erase or invent relationships. Keep grounded extraction.
             diagnostics["failed_batches"] += 1
             diagnostics["error_type"] = type(exc).__name__
+            batch_log = {"batch": start // MAX_COMPARISON_BATCH + 1, "claims": len(batch),
+                         "status": "failed", "error_type": type(exc).__name__,
+                         "elapsed_seconds": round(time.monotonic() - batch_started, 3)}
             if isinstance(exc, LLMError):
-                diagnostics.update({key: value for key, value in exc.diagnostics.items()
-                                    if key in {"category", "error_code", "http_status", "provider", "model",
-                                               "model_role", "request_id", "endpoint_host"}})
+                safe = safe_error_metadata(exc.diagnostics, client.configuration.api_key)
+                diagnostics.update(safe)
+                batch_log.update(safe)
+            diagnostics["batches"].append(batch_log)
             continue
+
+        diagnostics["batches"].append({"batch": start // MAX_COMPARISON_BATCH + 1,
+                                       "claims": len(batch), "status": "completed",
+                                       "elapsed_seconds": round(time.monotonic() - batch_started, 3)})
 
         for index, decision in decisions.items():
             if decision.verdict == "different":

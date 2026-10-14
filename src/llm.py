@@ -63,9 +63,26 @@ _ERROR_TYPES = {"insufficient_quota", "rate_limit_error", "invalid_request_error
 def _safe_identifier(value: Any, *secrets: str) -> str | None:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", value):
         return None
-    if any(secret and secret in value for secret in (*secrets, os.getenv("LLM_API_KEY", ""))):
+    if any(secret and secret in value for secret in
+           (*secrets, os.getenv("LLM_API_KEY", ""), os.getenv("OPENALEX_API_KEY", ""))):
         return "[redacted]"
     return value
+
+
+def safe_error_metadata(diagnostics: Any, api_key: str = "") -> dict[str, Any]:
+    """Allow bounded provider reason codes in persistent operational traces."""
+    if not isinstance(diagnostics, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("category", "error_code", "provider", "model", "model_role", "request_id", "endpoint_host"):
+        value = _safe_identifier(diagnostics.get(key), api_key)
+        if value and "://" not in value:
+            result[key] = value
+    for key in ("http_status", "retry_after_seconds", "attempts"):
+        value = diagnostics.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value <= 1_000_000_000:
+            result[key] = value
+    return result
 
 
 def _http_diagnostics(exc: urllib.error.HTTPError, api_key: str) -> dict[str, Any]:
@@ -368,6 +385,7 @@ class LLMClient:
         if self.provider is None:
             raise LLMError("No remote LLM provider is configured")
         request = self._route_model(request)
+        started = time.monotonic()
         try:
             response = self.provider.complete(request)
         except LLMError as exc:
@@ -387,8 +405,13 @@ class LLMClient:
                            diagnostics=self._request_diagnostics(request))
         self.last_response = response
         self.call_metadata.append({
-            "role": request.model_role, "provider": response.provider,
-            "model": response.model, "usage": response.usage,
+            "role": _safe_identifier(request.model_role, self.configuration.api_key),
+            "provider": _safe_identifier(response.provider, self.configuration.api_key) or "[redacted]",
+            "model": _safe_identifier(response.model, self.configuration.api_key) or "[redacted]",
+            "usage": {key: value for key, value in (response.usage if isinstance(response.usage, dict) else {}).items()
+                      if key in {"prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"}
+                      and isinstance(value, int) and not isinstance(value, bool) and value >= 0},
+            "elapsed_seconds": round(time.monotonic() - started, 3),
         })
         return response
 
@@ -453,9 +476,11 @@ class LLMClient:
 
         response = self.last_response
         return {
-            "provider": response.provider if response else self.provider_name,
-            "model": response.model if response else self.model,
-            "usage": response.usage if response else {},
+            "provider": _safe_identifier(response.provider if response else self.provider_name,
+                                         self.configuration.api_key) or "[redacted]",
+            "model": _safe_identifier(response.model if response else self.model,
+                                      self.configuration.api_key) or "[redacted]",
+            "usage": self.call_metadata[-1]["usage"] if self.call_metadata else {},
             "remote_available": self.available,
         }
 

@@ -1,9 +1,4 @@
-"""Reviewable, LLM-assisted research planning over existing harness state.
-
-The planner has no authority to approve claims, create durable research
-objects, or execute experiments. It may only create pending candidate entries
-when the caller explicitly requests that action.
-"""
+"""Read-only LLM-assisted research planning over existing harness state."""
 
 from __future__ import annotations
 
@@ -18,7 +13,7 @@ from . import db
 from .llm import LLMClient, LLMError, LLMMessage, LLMRequest
 from .research_actions import ResearchReference
 from .research_context import load_controller_context, validate_context_reference
-from .schemas import Conjecture, OpenProblem, PendingEntry, ResearchTask, StrictBase
+from .schemas import ResearchTask, StrictBase
 
 
 StateKind = Literal[
@@ -104,7 +99,7 @@ class ResearchPlanningResult:
 
 
 PLANNING_INSTRUCTIONS = """
-You are a research-planning assistant. Propose only reviewable next directions;
+You are a research-planning assistant. Propose only tentative next directions;
 do not state or imply that a theorem, conjecture, open problem, or experiment
 result is established. Use only IDs and state supplied in the request when
 populating relevant_existing_state. Do not invent citations or evidence.
@@ -246,7 +241,7 @@ def plan_research(
                 messages=(
                     LLMMessage(
                         role="system",
-                        content="You produce cautious, reviewable research plans from supplied project state.",
+                        content="You produce cautious, tentative research plans from supplied project state.",
                     ),
                     LLMMessage(role="user", content=json.dumps(prompt, sort_keys=True)),
                 ),
@@ -268,70 +263,12 @@ def plan_research(
 
     return ResearchPlanningResult(
         available=True,
-        message="Research plan generated for review; no proposal was persisted or executed.",
+        message="Research plan generated without persistence or execution.",
         plan=plan,
         selected_task=selected_task,
         state_context=state_context,
         provider_metadata=provider_client.metadata(),
     )
-
-
-def save_plan_as_pending(
-    result: ResearchPlanningResult,
-    goal: str,
-    db_path: str | Path | None = None,
-) -> list[int]:
-    """Persist only compatible plan proposals as existing pending-entry types."""
-
-    if not result.available or result.plan is None:
-        raise ValueError("a valid research plan is required before saving pending proposals")
-    task_id = result.selected_task.task_id if result.selected_task else result.plan.recommended_task_id
-    warning_prefix = "LLM-proposed research plan; requires human review"
-    entries: list[PendingEntry] = []
-
-    for proposal in result.plan.proposed_conjectures:
-        candidate = Conjecture(
-            statement=proposal.statement,
-            task_id=task_id,
-            motivation=proposal.rationale,
-            expected_status="unknown",
-            confidence="needs_review",
-            attack_plan="; ".join(proposal.dependencies_or_assumptions) or None,
-            notes=f"Uncertainty: {proposal.uncertainty_note}",
-        )
-        entries.append(
-            PendingEntry(
-                entry_type="conjecture_seed",
-                payload=candidate.model_dump(),
-                source_text=goal,
-                warnings=[warning_prefix, f"uncertainty: {proposal.uncertainty_note}"],
-            )
-        )
-
-    for proposal in result.plan.proposed_subquestions:
-        candidate = OpenProblem(
-            title=_title(proposal.question),
-            statement=proposal.question,
-            context=proposal.rationale,
-            task_id=task_id,
-            notes=(
-                "LLM-proposed research question, not an established open problem. "
-                f"Dependencies/assumptions: {'; '.join(proposal.dependencies_or_assumptions) or 'none'}. "
-                f"Uncertainty: {proposal.uncertainty_note}"
-            ),
-        )
-        entries.append(
-            PendingEntry(
-                entry_type="open_problem",
-                payload=candidate.model_dump(),
-                source_text=goal,
-                warnings=[warning_prefix, f"uncertainty: {proposal.uncertainty_note}"],
-            )
-        )
-
-    with db.get_connection(db_path) as connection:
-        db.create_tables(connection)
-        return [db.insert_pending_entry(connection, entry) for entry in entries]
 
 
 def _load_state_context(
@@ -429,7 +366,3 @@ def _validate_plan_references(
     for reference in plan.relevant_existing_state:
         if reference.object_id not in known_ids[reference.kind]:
             raise LLMError(f"LLM plan referenced unknown {reference.kind} id {reference.object_id}")
-
-
-def _title(value: str) -> str:
-    return value.replace("\n", " ").strip()[:80].rstrip(" .") or "Proposed research question"

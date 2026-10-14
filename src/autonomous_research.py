@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
+import time
 import traceback
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -14,7 +17,7 @@ from typing import Any, Literal
 from pydantic import Field, model_validator
 
 from . import db
-from .literature.discovery import LiteratureError, discover_full_text, extract_source_claims
+from .literature.discovery import LiteratureError, _LITERATURE_HINTS, discover_full_text, extract_source_claims
 from .literature.memory import compare_with_existing, completed_ingestion, existing_findings, review_scope, store_distillation
 from .llm import LLMClient, LLMError, LLMMessage, LLMRequest
 from .research_actions import BoundedExperimentParameters, ResearchReference, get_trusted_artifact, run_trusted_bounded_experiment
@@ -97,10 +100,20 @@ class AutonomousResearch:
             proposal = None
             parent_id = None
             self.client.call_metadata.clear()
+            stage_trace: list[dict[str, Any]] = []
             stage = "select_unit"
+            stage_started = time.monotonic()
+
+            def advance(next_stage: str) -> None:
+                nonlocal stage, stage_started
+                now = time.monotonic()
+                stage_trace.append({"stage": stage, "status": "completed",
+                                    "elapsed_seconds": round(now - stage_started, 3)})
+                stage, stage_started = next_stage, now
+
             try:
                 parent_id = unit_id if index == 0 and unit_id is not None else self._choose_unit(task_id)
-                stage = "load_context"
+                advance("load_context")
                 context = load_controller_context(
                     task_id, self.db_path, parent_id, allow_finished=True,
                 )
@@ -112,27 +125,33 @@ class AutonomousResearch:
                         parent_links = db.list_research_unit_links(connection, parent_id)
                     # Context loader includes and validates the linked input contents.
                 forced_literature = index == 0 and literature_from_unit
-                stage = "propose_step"
+                advance("propose_step")
                 proposal = self._propose(
                     context.summary, task.description or task.name, parent,
                     [link.model_dump() for link in parent_links], forced_literature,
                 )
                 if forced_literature and proposal.kind != "literature_review":
                     raise ValueError("LLM did not follow the forced literature-survey mode")
-                stage = "validate_references"
+                advance("validate_references")
                 for reference in proposal.references:
                     validate_context_reference(context, reference.kind, reference.object_id)
                 if proposal.target:
                     validate_context_reference(context, proposal.target.kind, proposal.target.object_id)
-                stage = "execute_step"
+                advance("execute_step")
                 new_id = self._execute(task_id, parent_id, proposal)
+                advance("completed")
                 created.append(new_id)
             except (LLMError, LiteratureError, ValueError, db.DatabaseError) as exc:
-                diagnostics = {
+                stage_trace.append({"stage": stage, "status": "failed",
+                                    "elapsed_seconds": round(time.monotonic() - stage_started, 3)})
+                diagnostics = _safe_failure_diagnostics({
                     **getattr(exc, "diagnostics", {}), "stage": stage,
                     "parent_unit_id": parent_id,
                     "proposed_kind": proposal.kind if proposal else None,
-                }
+                    "completed_unit_ids": list(created),
+                    "step_trace": stage_trace,
+                    "model_calls": list(self.client.call_metadata),
+                }, self.client.configuration.api_key)
                 incident_id = _record_research_failure(
                     exc, task_id, index + 1, diagnostics=diagnostics,
                     api_key=self.client.configuration.api_key,
@@ -382,6 +401,90 @@ class AutonomousResearch:
 DIAGNOSTIC_LOG = Path(__file__).resolve().parents[1] / "data" / "research_errors.jsonl"
 
 
+_DIAGNOSTIC_TEXT_FIELDS = {
+    "category", "error_code", "error_type", "provider", "model", "model_role",
+    "request_id", "endpoint_host", "response_schema", "stage", "status",
+    "proposed_kind", "literature_stage", "host",
+}
+_DIAGNOSTIC_NUMBER_FIELDS = {
+    "http_status", "retry_after_seconds", "attempts", "max_attempts",
+    "elapsed_seconds", "retry_delay_seconds", "attempt", "parent_unit_id",
+    "source_index", "results_returned", "candidates_remaining", "candidates",
+    "selected_index", "bytes_read", "pages", "characters", "chunk", "chunks",
+    "claims_returned", "claims_validated", "page", "error_count",
+}
+_TRACE_FIELDS = _DIAGNOSTIC_TEXT_FIELDS | _DIAGNOSTIC_NUMBER_FIELDS | {"api_key_configured"}
+_ERROR_HINTS = {
+    "quota_exhausted": "Check API credits and usage limits for the selected provider.",
+    "rate_limited": "Wait for the provider's retry interval before running again.",
+    "rate_limit_or_quota": "Check both API rate limits and remaining credits.",
+    "authentication": "Check the configured API key and endpoint.",
+    "permission_denied": "Check model and project access permissions.",
+    "invalid_request": "Check model support for structured responses and request parameters.",
+    "invalid_json": "The provider did not return parseable JSON for this stage.",
+    "schema_validation": "The provider's JSON did not match the required response schema.",
+}
+
+
+def _redact_diagnostic_text(value: str, secrets: tuple[str, ...], limit: int = 400) -> str:
+    for secret in secrets:
+        if secret:
+            value = value.replace(secret, "[redacted]")
+    value = re.sub(r"https?://[^\s]+", "[url]", value)
+    value = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [redacted]", value)
+    return value[:limit]
+
+
+def _safe_failure_diagnostics(raw: Any, api_key: str = "") -> dict[str, Any]:
+    """Keep bounded troubleshooting metadata, excluding prompts and source text."""
+    if not isinstance(raw, dict):
+        return {}
+    secrets = (api_key, os.getenv("LLM_API_KEY", ""), os.getenv("OPENALEX_API_KEY", ""))
+
+    def safe_field(key: str, value: Any) -> Any:
+        if key in _DIAGNOSTIC_TEXT_FIELDS and isinstance(value, str):
+            value = _redact_diagnostic_text(value, secrets, 160)
+            return value if "://" not in value and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}|\[redacted\]", value) else None
+        if key in _DIAGNOSTIC_NUMBER_FIELDS and value is None:
+            return None
+        if key in _DIAGNOSTIC_NUMBER_FIELDS and isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value if math.isfinite(value) and 0 <= value <= 1_000_000_000 else None
+        if key == "api_key_configured" and isinstance(value, bool):
+            return value
+        return None
+
+    result = {key: cleaned for key, value in raw.items()
+              if (cleaned := safe_field(key, value)) is not None or
+              (key in _DIAGNOSTIC_NUMBER_FIELDS and value is None)}
+    hint = _ERROR_HINTS.get(result.get("category")) or _LITERATURE_HINTS.get(result.get("literature_stage"))
+    if hint:
+        result["hint"] = hint
+    for key in ("literature_trace", "step_trace", "attempt_history"):
+        if isinstance(raw.get(key), list):
+            result[key] = [
+                {field: cleaned for field, value in item.items() if field in _TRACE_FIELDS
+                 and (cleaned := safe_field(field, value)) is not None}
+                for item in raw[key][-200:] if isinstance(item, dict)
+            ]
+    if isinstance(raw.get("completed_unit_ids"), list):
+        result["completed_unit_ids"] = [value for value in raw["completed_unit_ids"][-100:]
+                                        if isinstance(value, int) and value > 0]
+    if isinstance(raw.get("model_calls"), list):
+        result["model_calls"] = []
+        for item in raw["model_calls"][-100:]:
+            if not isinstance(item, dict):
+                continue
+            safe = {key: cleaned for key in ("role", "provider", "model", "elapsed_seconds")
+                    if (cleaned := safe_field("model_role" if key == "role" else key, item.get(key))) is not None}
+            usage = item.get("usage")
+            if isinstance(usage, dict):
+                safe["usage"] = {key: value for key, value in usage.items()
+                                 if key in {"prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"}
+                                 and isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000}
+            result["model_calls"].append(safe)
+    return result
+
+
 def _record_research_failure(
     exc: Exception, task_id: int, step_number: int, *,
     diagnostics: dict[str, Any] | None = None, api_key: str = "",
@@ -389,31 +492,35 @@ def _record_research_failure(
     """Write a private diagnostic without prompts, model output, or credentials."""
 
     incident_id = uuid4().hex[:12]
-    message = str(exc) if isinstance(exc, (LLMError, LiteratureError)) else type(exc).__name__
-    record = {
-        "time_utc": datetime.now(timezone.utc).isoformat(),
-        "incident_id": incident_id,
-        "task_id": task_id,
-        "step_number": step_number,
-        "error_type": type(exc).__name__,
-        "message": message,
-        "validation": getattr(exc, "details", ()),
-        "diagnostics": diagnostics if diagnostics is not None else getattr(exc, "diagnostics", {}),
-        "stack": [
-            {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
-            for frame in traceback.extract_tb(exc.__traceback__)[-12:]
-        ],
-    }
-    serialized = json.dumps(record, ensure_ascii=False)
-    for secret in (api_key, os.getenv("LLM_API_KEY", ""), os.getenv("OPENALEX_API_KEY", "")):
-        if secret:
-            serialized = serialized.replace(json.dumps(secret, ensure_ascii=False)[1:-1], "[redacted]")
     try:
+        secrets = (api_key, os.getenv("LLM_API_KEY", ""), os.getenv("OPENALEX_API_KEY", ""))
+        message = (str(exc) if isinstance(exc, (LLMError, LiteratureError)) else type(exc).__name__)
+        details = getattr(exc, "details", ())
+        record = {
+            "time_utc": datetime.now(timezone.utc).isoformat(),
+            "incident_id": incident_id,
+            "task_id": task_id,
+            "step_number": step_number,
+            "error_type": type(exc).__name__,
+            "message": _redact_diagnostic_text(message, secrets),
+            "validation": [
+                {"field": _redact_diagnostic_text(str(item.get("field", "")), secrets, 160),
+                 "issue": _redact_diagnostic_text(str(item.get("issue", "")), secrets, 160)}
+                for item in details[:20] if isinstance(item, dict)
+            ] if isinstance(details, (list, tuple)) else [],
+            "diagnostics": _safe_failure_diagnostics(
+                diagnostics if diagnostics is not None else getattr(exc, "diagnostics", {}), api_key),
+            "stack": [
+                {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+                for frame in traceback.extract_tb(exc.__traceback__)[-12:]
+            ],
+        }
+        serialized = json.dumps(record, ensure_ascii=False, allow_nan=False)
         DIAGNOSTIC_LOG.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         with os.fdopen(os.open(DIAGNOSTIC_LOG, flags, 0o600), "a", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(serialized + "\n")
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return None
     return incident_id

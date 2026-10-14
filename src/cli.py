@@ -15,7 +15,6 @@ from .code_artifacts import (
     update_code_artifact_status,
 )
 from .experiment_manager import run_experiment
-from .extract import LLMClient as ExtractionLLMClient, extract_from_text
 from .experiments.ats_brute_solver import find_memoryless_safety_strategy
 from .experiments.ats_generator import generate_tiny_game
 from .experiments.ats_models import SafetyGame
@@ -28,11 +27,8 @@ from .literature import (
     write_research_memo,
 )
 from .llm import LLMClient as ProviderLLMClient
-from .llm import LLMError
 from .autonomous_research import AutonomousResearch
-from .orchestrator import run_pipeline
 from .research_units import add_paper_for_unit, record_partial_result
-from .research_planning import plan_research
 from .schemas import Concept, ConceptLink, Conjecture, ResearchTask, ResearchUnit, ResearchUnitLink
 
 
@@ -100,14 +96,6 @@ def build_parser() -> argparse.ArgumentParser:
     verification_parser.add_argument("--topic-id", required=True, type=int)
     verification_parser.add_argument("--output", help="Markdown verification task path")
 
-    plan_parser = subparsers.add_parser(
-        "plan-research",
-        help="Propose reviewable research directions from stored state; never executes them",
-    )
-    plan_parser.add_argument("--goal", required=True, help="Free-form research objective")
-    plan_parser.add_argument("--task-id", dest="task_id", type=int, help="Restrict planning to an existing research task")
-    plan_parser.add_argument("--llm", action="store_true", help="Use the configured remote LLM provider")
-
     controller_parser = subparsers.add_parser(
         "research-loop",
         help="Run bounded autonomous research steps; each successful step creates a unit",
@@ -117,31 +105,6 @@ def build_parser() -> argparse.ArgumentParser:
     controller_parser.add_argument("--llm", action="store_true", help="Use the configured remote LLM provider")
     controller_parser.add_argument("--steps", default=1, type=int, help="Number of completed research units to create")
     controller_parser.add_argument("--literature-from-unit", action="store_true", help="Force full-text survey as the first step from --unit-id")
-
-    extract_parser = subparsers.add_parser("extract-from-text", help="Extract entries into pending queue")
-    extract_parser.add_argument("--text", help="Text to extract from")
-    extract_parser.add_argument("--file", help="Text file to extract from")
-    extract_parser.add_argument("--prompt-file", help="Prompt file to prepend to the extraction text")
-    extract_parser.add_argument("--paper-id", type=int, help="Source paper id to attach to extracted candidates")
-    extract_parser.add_argument("--output-json", help="Write extraction metadata to this JSON path")
-    extract_parser.add_argument("--unit-id", type=int, help="Link pending candidates to a research activity")
-    extract_parser.add_argument(
-        "--llm",
-        action="store_true",
-        help="Use the explicitly configured remote LLM provider; otherwise use deterministic extraction",
-    )
-
-    pdf_extract_parser = subparsers.add_parser("extract-from-pdf", help="Extract entries from a local PDF into pending queue")
-    pdf_extract_parser.add_argument("--paper-id", type=int, required=True)
-    pdf_extract_parser.add_argument("--pdf", required=True)
-    pdf_extract_parser.add_argument("--prompt-file")
-    pdf_extract_parser.add_argument("--output-json")
-    pdf_extract_parser.add_argument("--unit-id", type=int, help="Link pending candidates to a research activity")
-    pdf_extract_parser.add_argument(
-        "--llm",
-        action="store_true",
-        help="Use the explicitly configured remote LLM provider; otherwise use deterministic extraction",
-    )
 
 
     task_parser = subparsers.add_parser("add-task", aliases=["add-research-task"], help="Add a research task")
@@ -286,10 +249,6 @@ def build_parser() -> argparse.ArgumentParser:
     brute_parser = subparsers.add_parser("brute-check", help="Run bounded memoryless distributed safety check")
     brute_parser.add_argument("--input", help="Game JSON file; if omitted, a simple ATS game is generated")
     brute_parser.add_argument("--depth", type=int, default=5)
-
-    pipeline_parser = subparsers.add_parser("run-pipeline", help="Run one bounded manual pipeline step")
-    pipeline_parser.add_argument("--task-id", dest="task_id", required=True, type=int)
-    pipeline_parser.add_argument("--mode", required=True, choices=["literature", "experiments"])
 
     artifact_parser = subparsers.add_parser("register-code-artifact", help="Register reusable code metadata")
     artifact_parser.add_argument("--name", required=True)
@@ -453,25 +412,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if args.command == "plan-research":
-        try:
-            result = plan_research(
-                args.goal,
-                task_id=args.task_id,
-                use_llm=args.llm,
-                db_path=args.db,
-            )
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
-        if not result.available or result.plan is None:
-            print(result.message)
-            return 2
-        payload = result.plan.model_dump()
-        payload["provider"] = result.provider_metadata
-        payload["message"] = result.message
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return 0
-
     if args.command == "research-loop":
         if not args.llm:
             print("research-loop requires --llm and a configured remote LLM provider; nothing was written.")
@@ -495,54 +435,6 @@ def main(argv: list[str] | None = None) -> int:
             "diagnostics": result.diagnostics,
         }, indent=2, sort_keys=True))
         return 0 if result.status == "completed" else 2
-
-    if args.command == "extract-from-text":
-        if args.unit_id is not None:
-            _require_unit(args.db, args.unit_id)
-        text = _with_prompt(_read_text_arg(args.text, args.file), args.prompt_file)
-        client = ExtractionLLMClient(use_configured_provider=args.llm)
-        try:
-            entry_ids = extract_from_text(text, db_path=args.db, client=client)
-        except LLMError:
-            print("LLM extraction failed validation; no entries were written.")
-            return 2
-        if args.paper_id:
-            _annotate_pending_paper(args.db, entry_ids, args.paper_id)
-        if args.unit_id is not None:
-            _link_pending_to_unit(args.db, args.unit_id, entry_ids)
-        if args.output_json:
-            payload = {"pending_entry_ids": entry_ids, "paper_id": args.paper_id}
-            if args.llm:
-                payload["llm"] = client.metadata
-            _write_json(Path(args.output_json), payload)
-        mode = "provider" if client.used_remote else "dry-run"
-        print(f"Inserted pending entries ({mode}): {', '.join(str(entry_id) for entry_id in entry_ids)}")
-        return 0
-
-    if args.command == "extract-from-pdf":
-        if args.unit_id is not None:
-            _require_unit(args.db, args.unit_id)
-        text = _with_prompt(_read_pdfish_text(Path(args.pdf)), args.prompt_file)
-        client = ExtractionLLMClient(use_configured_provider=args.llm)
-        try:
-            entry_ids = extract_from_text(text, db_path=args.db, client=client)
-        except LLMError:
-            print("LLM extraction failed validation; no entries were written.")
-            return 2
-        _annotate_pending_paper(args.db, entry_ids, args.paper_id)
-        if args.unit_id is not None:
-            _link_pending_to_unit(args.db, args.unit_id, entry_ids)
-        if args.output_json:
-            payload = {"pending_entry_ids": entry_ids, "paper_id": args.paper_id, "pdf": args.pdf}
-            if args.llm:
-                payload["llm"] = client.metadata
-            _write_json(
-                Path(args.output_json),
-                payload,
-            )
-        mode = "provider" if client.used_remote else "dry-run"
-        print(f"Inserted pending entries from PDF ({mode}): {', '.join(str(entry_id) for entry_id in entry_ids)}")
-        return 0
 
 
     if args.command in {"add-task", "add-research-task"}:
@@ -798,11 +690,6 @@ def main(argv: list[str] | None = None) -> int:
             print("counterexample=" + json.dumps(result.counterexample))
         return 0
 
-    if args.command == "run-pipeline":
-        result = run_pipeline(task_id=args.task_id, mode=args.mode, db_path=args.db)
-        print(result.summary)
-        return 0
-
     if args.command == "register-code-artifact":
         artifact_id = register_code_artifact(
             name=args.name,
@@ -963,31 +850,6 @@ def _require_unit(db_path: str, unit_id: int) -> ResearchUnit:
     return unit
 
 
-def _link_pending_to_unit(db_path: str, unit_id: int, entry_ids: list[int]) -> None:
-    with db.get_connection(db_path) as connection:
-        db.create_tables(connection)
-        unit = db.get_research_unit(connection, unit_id)
-        if unit is None:
-            raise ValueError(f"research unit {unit_id} does not exist")
-        for entry_id in entry_ids:
-            entry = db.get_pending_entry(connection, entry_id)
-            if entry is None:
-                raise ValueError(f"pending entry {entry_id} does not exist")
-            if entry.entry_type in {"model", "theorem", "reduction", "open_problem", "conjecture_seed"}:
-                payload = dict(entry.payload)
-                payload["task_id"] = unit.task_id
-                db.update_pending_payload(connection, entry_id, payload)
-            db.link_research_unit(
-                connection,
-                ResearchUnitLink(
-                    unit_id=unit_id,
-                    relation="produces",
-                    object_type="pending_entry",
-                    object_id=entry_id,
-                ),
-            )
-
-
 def _split_semicolon(value: str | None) -> list[str]:
     if not value:
         return []
@@ -1012,53 +874,9 @@ def _resolve_id(positional: int | None, named: int | None, label: str) -> int:
     return resolved
 
 
-def _with_prompt(text: str, prompt_file: str | None) -> str:
-    if prompt_file is None:
-        return text
-    prompt = Path(prompt_file).read_text(encoding="utf-8")
-    return f"{prompt}\n\n--- SOURCE TEXT ---\n{text}"
-
-
-def _read_pdfish_text(path: Path) -> str:
-    if not path.exists():
-        raise SystemExit(f"PDF does not exist: {path}")
-    data = path.read_bytes()
-    # This is a dependency-free MVP fallback. Real PDF extraction can be swapped
-    # in later; pending entries still require human curation.
-    return data.decode("utf-8", errors="replace")
-
-
-def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def _annotate_pending_paper(db_path: str, entry_ids: list[int], paper_id: int) -> None:
-    with db.get_connection(db_path) as connection:
-        db.create_tables(connection)
-        for entry_id in entry_ids:
-            entry = db.get_pending_entry(connection, entry_id)
-            if entry is None:
-                continue
-            payload = dict(entry.payload)
-            payload.setdefault("paper_id", paper_id)
-            payload.setdefault("source_paper_id", paper_id)
-            db.update_pending_payload(connection, entry_id, payload)
-
-
-
-
 def _combine_notes(*parts: str | None) -> str | None:
     values = [part for part in parts if part]
     return "\n".join(values) if values else None
-
-
-def _read_text_arg(text: str | None, file_path: str | None) -> str:
-    if text is not None:
-        return text
-    if file_path is not None:
-        return Path(file_path).read_text(encoding="utf-8")
-    return sys.stdin.read()
 
 
 def _load_game(file_path: str | None) -> SafetyGame:

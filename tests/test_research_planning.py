@@ -1,9 +1,8 @@
 import json
 
 from src import db
-from src.cli import main
 from src.llm import LLMClient, LLMRequest, LLMResponse
-from src.research_planning import assess_literature_need, plan_research, save_plan_as_pending
+from src.research_planning import assess_literature_need, plan_research
 from src.schemas import Paper, ResearchUnit
 
 
@@ -120,55 +119,6 @@ def test_plan_research_rejects_unknown_state_references(tmp_path):
 
     assert not result.available
     assert "unknown research_task id 999" in result.message
-
-
-def test_save_plan_as_pending_keeps_proposals_out_of_durable_tables(tmp_path):
-    db_path = tmp_path / "research.db"
-    db.initialize_database(db_path)
-    _create_task(db_path)
-    result = plan_research(
-        "Investigate finite memory for three-process ATS safety.",
-        task_id=1,
-        use_llm=True,
-        db_path=db_path,
-        client=LLMClient(provider=FakePlanningProvider(_plan_payload())),
-    )
-
-    pending_ids = save_plan_as_pending(result, "Investigate finite memory for three-process ATS safety.", db_path)
-
-    with db.get_connection(db_path) as connection:
-        pending = db.list_pending_entries(connection)
-        conjectures = db.list_conjectures(connection)
-        open_problems = db.list_open_problems(connection)
-
-    assert len(pending_ids) == 2
-    assert {entry.entry_type for entry in pending} == {"conjecture_seed", "open_problem"}
-    assert all(entry.status == "pending" for entry in pending)
-    assert all(any("requires human review" in warning for warning in entry.warnings) for entry in pending)
-    assert conjectures == []
-    assert open_problems == []
-
-
-def test_plan_research_without_llm_is_a_clean_no_write_response(tmp_path, capsys):
-    db_path = tmp_path / "research.db"
-
-    exit_code = main(
-        [
-            "--db",
-            str(db_path),
-            "plan-research",
-            "--goal",
-            "Investigate finite memory for three-process ATS safety.",
-        ]
-    )
-    output = capsys.readouterr().out
-
-    with db.get_connection(db_path) as connection:
-        pending = db.list_pending_entries(connection)
-
-    assert exit_code == 2
-    assert "requires --llm" in output
-    assert pending == []
 
 
 def test_literature_need_assessment_uses_stored_ids_without_writing(tmp_path):

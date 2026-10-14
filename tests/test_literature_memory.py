@@ -13,7 +13,7 @@ from src.literature.discovery import (
 )
 from src.literature.identity import same_paper, source_identifier
 from src.literature.memory import compare_with_existing, completed_ingestion, review_scope, store_distillation
-from src.llm import LLMClient
+from src.llm import LLMClient, LLMError
 from src.research_context import load_controller_context
 from src.schemas import Paper, ResearchTask, ResearchUnit, ResearchUnitLink
 from tests.test_autonomous_research import SequenceProvider, _proposal
@@ -274,9 +274,34 @@ def test_untrusted_comparison_id_is_ignored_and_claim_remains(state):
         compared = compare_with_existing(connection, state[1], client, checked, [candidate])
     assert compared == [candidate]
     assert checked.diagnostics["semantic_comparison"]["status"] == "unavailable"
+    assert checked.diagnostics["semantic_comparison"]["batches"][0]["status"] == "failed"
     ingest(state, checked, compared)
     with db.get_connection(state[0]) as connection:
         assert len(db.list_theorems(connection)) == 2
+
+
+def test_comparison_fallback_discards_untrusted_provider_metadata(state):
+    ingest(state, source(), [claim()])
+
+    class Provider:
+        provider_name = "fake"
+        model = "fake-model"
+
+        def complete(self, request):
+            raise LLMError("Private error", diagnostics={
+                "category": "quota_exhausted", "provider": "private source excerpt",
+                "endpoint_host": "https://example.test/private?token=abc",
+                "raw_response": "private source excerpt", "http_status": 429,
+            })
+
+    paper = source(diagnostics={"review_scope": "comparison fallback"})
+    with db.get_connection(state[0]) as connection:
+        result = compare_with_existing(connection, state[1], LLMClient(provider=Provider()), paper,
+                                       [claim(statement="Finite memory works in finite games")])
+    assert result[0].relationship == "new"
+    assert paper.diagnostics["semantic_comparison"]["category"] == "quota_exhausted"
+    assert "private source excerpt" not in json.dumps(paper.diagnostics)
+    assert "https://example.test/private" not in json.dumps(paper.diagnostics)
 
 
 def test_exact_match_skips_comparison_call(state):
@@ -313,3 +338,5 @@ def test_long_extraction_compares_every_claim_in_bounded_batches(state):
     assert len(client.call_metadata) == 2
     assert all(item.relationship == "possible_duplicate" for item in compared)
     assert checked.diagnostics["semantic_comparison"]["flagged"] == 7
+    assert [item["claims"] for item in checked.diagnostics["semantic_comparison"]["batches"]] == [6, 1]
+    assert all(item["elapsed_seconds"] >= 0 for item in checked.diagnostics["semantic_comparison"]["batches"])

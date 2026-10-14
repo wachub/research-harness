@@ -6,7 +6,6 @@ from email.message import Message
 import pytest
 from pydantic import BaseModel
 
-from src.extract import LLMClient as ExtractionLLMClient
 from src.llm import LLMClient, LLMConfiguration, LLMError, LLMMessage, LLMRequest, LLMResponse, OpenAICompatibleProvider
 from src.literature import demo
 
@@ -70,61 +69,6 @@ def test_client_validates_structured_response_and_exposes_safe_metadata():
         "usage": {"total_tokens": 12},
         "remote_available": True,
     }
-
-
-class FakeExtractionProvider:
-    provider_name = "fake"
-    model = "fake-model"
-
-    def __init__(self, candidates: list[dict]):
-        self.candidates = candidates
-
-    def complete(self, request: LLMRequest) -> LLMResponse:
-        assert request.json_mode
-        return LLMResponse(
-            content=json.dumps({"candidates": self.candidates}),
-            provider=self.provider_name,
-            model=self.model,
-        )
-
-
-def test_remote_extraction_validates_payload_before_pending_entry_creation():
-    client = ExtractionLLMClient(
-        provider=FakeExtractionProvider(
-            [
-                {
-                    "entry_type": "theorem",
-                    "payload": {
-                        "statement": "Two-process ATS safety is decidable under the stated assumptions.",
-                        "theorem_type": "decidability",
-                        "model_family": "ATS games",
-                        "objective_family": "safety",
-                    },
-                }
-            ]
-        ),
-        use_configured_provider=True,
-    )
-
-    entries = client.extract_pending_entries("Theorem source text")
-
-    assert client.used_remote
-    assert not client.dry_run
-    assert entries[0].entry_type == "theorem"
-    assert entries[0].payload["statement"].startswith("Two-process ATS")
-    assert "dry-run extraction" not in entries[0].warnings
-
-
-def test_invalid_remote_extraction_payload_is_rejected_before_queueing():
-    client = ExtractionLLMClient(
-        provider=FakeExtractionProvider(
-            [{"entry_type": "theorem", "payload": {"statement": ""}}]
-        ),
-        use_configured_provider=True,
-    )
-
-    with pytest.raises(LLMError, match="failed validation"):
-        client.extract_pending_entries("Theorem source text")
 
 
 def test_memo_organizer_uses_shared_client_and_rejects_unknown_citations(monkeypatch):

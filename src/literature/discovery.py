@@ -24,7 +24,7 @@ from pydantic import Field, model_validator
 from pypdf import PdfReader
 
 
-from ..llm import LLMClient, LLMError, LLMMessage, LLMRequest
+from ..llm import LLMClient, LLMError, LLMMessage, LLMRequest, safe_error_metadata
 from ..schemas import StrictBase
 from .identity import digest, source_identifier
 
@@ -59,11 +59,7 @@ _LITERATURE_HINTS = {
 def _failure_metadata(exc: Exception) -> dict[str, Any]:
     """Keep reason codes, not external exception text, URLs, bodies or research text."""
     if isinstance(exc, (LiteratureError, LLMError)):
-        allowed = {"category", "error_code", "http_status", "provider", "model", "model_role",
-                   "request_id", "retry_after_seconds", "attempts", "endpoint_host"}
-        return {"error_type": type(exc).__name__, **{
-            key: value for key, value in exc.diagnostics.items() if key in allowed
-        }}
+        return {"error_type": type(exc).__name__, **safe_error_metadata(exc.diagnostics)}
     if isinstance(exc, urllib.error.HTTPError):
         return {"error_type": "HTTPError", "category": "http_error", "http_status": exc.code}
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc

@@ -243,7 +243,7 @@ class OpenProblem(StrictBase):
 
 
 class PendingEntry(StrictBase):
-    """An extracted candidate awaiting human curation."""
+    """Historical candidate retained for reading pre-retirement queue rows."""
 
     id: int | None = None
     entry_type: EntryType

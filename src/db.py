@@ -7,7 +7,7 @@ import hashlib
 import os
 import re
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 import psycopg
 from psycopg import sql
@@ -1286,37 +1286,6 @@ def list_open_problems(connection: PostgresConnection, task_id: int | None = Non
     return [_row_to_open_problem(row) for row in rows]
 
 
-def insert_pending_entry(connection: PostgresConnection, entry: PendingEntry) -> int:
-    """Insert a pending extracted entry and return its id."""
-
-    connection.execute(
-        """
-        INSERT INTO pending_entries
-            (entry_type, payload_json, source_text, status, duplicate_of, warnings_json)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            entry.entry_type,
-            _json_dumps(entry.payload),
-            entry.source_text,
-            entry.status,
-            entry.duplicate_of,
-            _json_dumps(entry.warnings),
-        ),
-    )
-    entry_id = _last_insert_id(connection)
-    _record_event(
-        connection,
-        _task_id_from_pending(entry),
-        "pending_created",
-        "pending_entry",
-        entry_id,
-        f"Created pending {entry.entry_type} proposal",
-        {"entry_type": entry.entry_type, "status": entry.status},
-    )
-    return entry_id
-
-
 def get_pending_entry(connection: PostgresConnection, entry_id: int) -> PendingEntry | None:
     """Fetch a pending entry by id."""
 
@@ -1338,68 +1307,6 @@ def list_pending_entries(
             (status,),
         ).fetchall()
     return [_row_to_pending_entry(row) for row in rows]
-
-
-def update_pending_status(
-    connection: PostgresConnection,
-    entry_id: int,
-    status: str,
-    duplicate_of: str | None = None,
-    warnings: Iterable[str] | None = None,
-) -> None:
-    """Update curation status for a pending entry."""
-
-    entry = get_pending_entry(connection, entry_id)
-    if entry is None:
-        raise ValueError(f"pending entry {entry_id} does not exist")
-    connection.execute(
-        """
-        UPDATE pending_entries
-        SET status = ?,
-            duplicate_of = COALESCE(?, duplicate_of),
-            warnings_json = COALESCE(?, warnings_json),
-            reviewed_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        """,
-        (
-            status,
-            duplicate_of,
-            _json_dumps(list(warnings)) if warnings is not None else None,
-            entry_id,
-        ),
-    )
-    _record_event(
-        connection,
-        _task_id_from_pending(entry),
-        f"pending_{status}",
-        "pending_entry",
-        entry_id,
-        f"Marked pending {entry.entry_type} proposal as {status}",
-        {"entry_type": entry.entry_type, "duplicate_of": duplicate_of},
-    )
-
-
-def update_pending_payload(
-    connection: PostgresConnection,
-    entry_id: int,
-    payload: dict[str, Any],
-    warnings: Iterable[str] | None = None,
-) -> None:
-    """Replace the payload for a pending entry, optionally replacing warnings."""
-
-    connection.execute(
-        """
-        UPDATE pending_entries
-        SET payload_json = ?,
-            warnings_json = COALESCE(?, warnings_json)
-        WHERE id = ?
-        """,
-        (
-            _json_dumps(payload),
-            _json_dumps(list(warnings)) if warnings is not None else None,
-            entry_id,
-        ),
-    )
 
 
 def insert_derived_result(connection: PostgresConnection, result: DerivedResult) -> int:
@@ -2113,11 +2020,6 @@ def _record_event(
             metadata=metadata or {},
         ),
     )
-
-
-def _task_id_from_pending(entry: PendingEntry) -> int | None:
-    value = entry.payload.get("task_id")
-    return value if isinstance(value, int) and value > 0 else None
 
 
 def _row_to_concept(row: Mapping[str, Any]) -> Concept:

@@ -63,6 +63,29 @@ def test_selection_failure_and_pdf_failure_survive_successful_html_fallback(monk
     assert "Finite safety" not in json.dumps(trace)
 
 
+def test_fallback_trace_drops_untrusted_provider_diagnostic_text(monkeypatch):
+    class Provider:
+        provider_name = "fake"
+        model = "fake-model"
+
+        def complete(self, request):
+            raise LLMError("Provider returned private text", diagnostics={
+                "category": "quota_exhausted", "provider": "private source excerpt",
+                "request_id": "https://example.test/private?token=abc",
+                "raw_response": "private source excerpt", "http_status": 429,
+            })
+
+    monkeypatch.setattr(d, "_openalex_works", lambda *_: [work()])
+    monkeypatch.setattr(d, "_download_pdf", lambda *_: b"%PDF-invalid")
+    monkeypatch.setattr(d, "_download_html", lambda *_: b"<article>" + b"Real article text. " * 40 + b"</article>")
+    paper = d.discover_full_text("finite safety", client=LLMClient(provider=Provider()))
+    trace = paper.diagnostics["literature_trace"]
+    selection = next(item for item in trace if item["stage"] == "selection")
+    assert selection["category"] == "quota_exhausted" and selection["http_status"] == 429
+    assert "private source excerpt" not in json.dumps(trace)
+    assert "https://example.test/private" not in json.dumps(trace)
+
+
 def test_parse_failure_distinct_from_download_failure(monkeypatch):
     candidate = work()
     candidate["best_oa_location"].pop("landing_page_url")

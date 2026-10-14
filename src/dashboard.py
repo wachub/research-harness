@@ -1,19 +1,14 @@
-"""Read models and safe review adapters used by the local Streamlit dashboard."""
+"""Read models and bounded-run adapters used by the local Streamlit dashboard."""
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from . import db
-from .curate import analyze_pending_entry, approve_pending, flag_pending, reject_pending
 from .git_utils import get_current_commit_hash
 from .llm import LLMClient, LLMConfiguration
-from .research_controller import ResearchController
 from .autonomous_research import AutonomousResearch
-from .research_planning import assess_literature_need
-from .research_policy import ControllerMode
 
 
 def dashboard_summary(db_path: str | Path | None = None) -> dict[str, Any]:
@@ -22,7 +17,6 @@ def dashboard_summary(db_path: str | Path | None = None) -> dict[str, Any]:
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
         tasks = db.list_tasks(connection)
-        pending = db.list_pending_entries(connection, status=None)
         units = db.list_research_units(connection)
         counts = {
             "research_tasks": len(tasks),
@@ -33,7 +27,6 @@ def dashboard_summary(db_path: str | Path | None = None) -> dict[str, Any]:
             "reductions": len(db.list_reductions(connection)),
             "conjectures": len(db.list_conjectures(connection)),
             "open_problems": len(db.list_open_problems(connection)),
-            "pending_entries": len(pending),
             "proof_attempts": len(db.list_proof_attempts(connection)),
             "evidence_spans": len(db.list_evidence_spans(connection)),
             "experiment_runs": len(db.list_experiment_runs(connection)),
@@ -45,7 +38,6 @@ def dashboard_summary(db_path: str | Path | None = None) -> dict[str, Any]:
     return {
         "counts": counts,
         "recent": recent,
-        "pending": pending_review_items(db_path, limit=10),
         "active_conjectures": active_conjectures,
         "active_open_problems": active_problems,
     }
@@ -68,7 +60,6 @@ def project_summaries(db_path: str | Path | None = None) -> list[dict[str, Any]]
 
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
-        pending = db.list_pending_entries(connection, status=None)
         result = []
         for task in db.list_tasks(connection):
             task_id = task.task_id
@@ -82,7 +73,6 @@ def project_summaries(db_path: str | Path | None = None) -> list[dict[str, Any]]
                     "open_problems": len(db.list_open_problems(connection, task_id=task_id)),
                     "proof_attempts": len(db.list_proof_attempts(connection, task_id=task_id)),
                     "experiment_runs": len(db.list_experiment_runs(connection, task_id=task_id)),
-                    "pending_proposals": sum(_pending_task_id(item) == task_id for item in pending),
                 }
             )
     return result
@@ -101,7 +91,6 @@ def project_detail(task_id: int, db_path: str | Path | None = None) -> dict[str,
         notes = [item for item in db.list_literature_notes(connection) if item.paper_id in paper_ids]
         summaries = [item for item in db.list_literature_summaries(connection) if item.paper_id in paper_ids]
         evidence = [item for item in db.list_evidence_spans(connection) if item.paper_id in paper_ids]
-        pending = [item for item in db.list_pending_entries(connection, status=None) if _pending_task_id(item) == task_id]
         artifacts = [item for item in db.list_code_artifacts(connection) if item.task_id in {None, task_id}]
         units = db.list_research_units(connection, task_id=task_id)
         next_unit = db.next_research_unit(connection, task_id)
@@ -125,7 +114,6 @@ def project_detail(task_id: int, db_path: str | Path | None = None) -> dict[str,
             "literature_summaries": _dump(summaries),
             "experiment_runs": _dump(db.list_experiment_runs(connection, task_id=task_id)),
             "code_artifacts": _dump(artifacts),
-            "pending_entries": _dump(pending),
         }
 
 
@@ -151,88 +139,6 @@ def run_research_steps(
         "diagnostics": result.diagnostics,
         "blocked_research_unit_ids": list(result.blocked_unit_ids),
     }
-
-
-def continue_research(
-    task_id: int, unit_id: int | None = None,
-    db_path: str | Path | None = None, client: LLMClient | None = None,
-    model_overrides: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """Run one explicit, bounded controller step for the selected task/unit."""
-
-    with db.get_connection(db_path) as connection:
-        db.create_tables(connection)
-        task = db.get_task(connection, task_id)
-        if task is None:
-            raise ValueError(f"research task {task_id} does not exist")
-    goal = task.description or task.name
-    controller = ResearchController(client or LLMClient(model_overrides=model_overrides), db_path=db_path)
-    result = controller.run(
-        goal, task_id, unit_id=unit_id, mode=ControllerMode.AUTONOMOUS, max_steps=1,
-    )
-    return {
-        "status": result.status,
-        "message": result.message,
-        "research_unit_id": controller.selected_unit_id,
-        "steps": [asdict(step) for step in result.steps],
-        "log_path": str(result.log_path) if result.log_path else None,
-    }
-
-
-def assess_research_unit_literature(
-    task_id: int, unit_id: int,
-    db_path: str | Path | None = None, client: LLMClient | None = None,
-    model_overrides: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """Assess existing literature coverage without fetching sources or writing state."""
-
-    result = assess_literature_need(
-        task_id, unit_id, db_path=db_path,
-        client=client or LLMClient(model_overrides=model_overrides),
-    )
-    return {
-        "available": result.available,
-        "message": result.message,
-        "assessment": result.assessment.model_dump() if result.assessment else None,
-        "provider": result.provider_metadata,
-    }
-
-
-def pending_review_items(db_path: str | Path | None = None, limit: int | None = None) -> list[dict[str, Any]]:
-    """Read the review queue using the existing duplicate/curation analysis."""
-
-    with db.get_connection(db_path) as connection:
-        db.create_tables(connection)
-        raw_rows = {row["id"]: row for row in db.list_explorer_records(connection, "pending_entries", limit=5_000)}
-        result = []
-        for entry in db.list_pending_entries(connection, status=None):
-            warnings, duplicates = analyze_pending_entry(connection, entry)
-            raw = raw_rows.get(entry.id, {})
-            result.append(
-                {
-                    **entry.model_dump(),
-                    "created_at": raw.get("created_at"),
-                    "reviewed_at": raw.get("reviewed_at"),
-                    "duplicates": [duplicate.__dict__ for duplicate in duplicates],
-                    "warnings": warnings,
-                }
-            )
-    return result[:limit] if limit is not None else result
-
-
-def approve_review_item(entry_id: int, db_path: str | Path | None = None) -> dict[str, Any]:
-    """Use the exact existing approval path; no GUI-specific approval exists."""
-
-    result = approve_pending(entry_id, db_path=db_path)
-    return {"pending_id": result.pending_id, "inserted_table": result.inserted_table, "inserted_id": result.inserted_id}
-
-
-def reject_review_item(entry_id: int, reason: str | None = None, db_path: str | Path | None = None) -> None:
-    reject_pending(entry_id, reason=reason, db_path=db_path)
-
-
-def flag_review_item(entry_id: int, reason: str, db_path: str | Path | None = None) -> None:
-    flag_pending(entry_id, reason=reason, db_path=db_path)
 
 
 def explorer_records(table_name: str, db_path: str | Path | None = None, limit: int = 500) -> list[dict[str, Any]]:
@@ -290,7 +196,6 @@ def system_status(db_path: str | Path | None = None) -> dict[str, Any]:
     configuration = LLMConfiguration.from_environment()
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
-        pending_count = len(db.list_pending_entries(connection, status="pending"))
         artifacts = db.list_code_artifacts(connection)
         database_name = connection.execute("SELECT current_database() AS name").fetchone()["name"]
     return {
@@ -300,7 +205,6 @@ def system_status(db_path: str | Path | None = None) -> dict[str, Any]:
         "database_engine": "postgresql",
         "database_name": database_name,
         "git_commit": get_current_commit_hash(),
-        "pending_review_items": pending_count,
         "tested_code_artifacts": sum(item.status == "tested" for item in artifacts),
         "code_artifacts": len(artifacts),
     }
@@ -308,15 +212,10 @@ def system_status(db_path: str | Path | None = None) -> dict[str, Any]:
 
 def _recent_records(connection) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for table in ("research_units", "papers", "theorems", "conjectures", "open_problems", "pending_entries", "experiment_runs"):
+    for table in ("research_units", "papers", "theorems", "conjectures", "open_problems", "experiment_runs"):
         for row in db.list_explorer_records(connection, table, limit=5):
             records.append({"table": table, "created_at": row.get("created_at"), "record": row})
     return sorted(records, key=lambda item: item["created_at"] or "", reverse=True)[:12]
-
-
-def _pending_task_id(entry) -> int | None:
-    value = entry.payload.get("task_id")
-    return value if isinstance(value, int) else None
 
 
 def _dump(items) -> list[dict[str, Any]]:
