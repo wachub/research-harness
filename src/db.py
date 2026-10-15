@@ -1664,6 +1664,20 @@ def list_research_units_for_object(
     return [ResearchUnitLink.model_validate(dict(row)) for row in rows]
 
 
+def get_linked_research_object(
+    connection: PostgresConnection, object_type: str, object_id: int,
+) -> dict[str, Any] | None:
+    """Read one allow-listed unit-link target for inspection in the GUI."""
+
+    if object_type not in _UNIT_LINK_TARGETS:
+        raise ValueError(f"unsupported research object type: {object_type}")
+    table, key = _UNIT_LINK_TARGETS[object_type]
+    row = connection.execute(
+        f"SELECT * FROM {table} WHERE {key} = ?", (object_id,),
+    ).fetchone()
+    return _decode_explorer_row(row) if row else None
+
+
 _UNIT_LINK_TARGETS: dict[str, tuple[str, str]] = {
     "research_unit": ("research_units", "unit_id"),
     "paper": ("papers", "id"),
@@ -1681,6 +1695,16 @@ _UNIT_LINK_TARGETS: dict[str, tuple[str, str]] = {
     "experiment_run": ("experiment_runs", "run_id"),
     "code_artifact": ("code_artifacts", "artifact_id"),
     "pending_entry": ("pending_entries", "id"),
+}
+
+LINKED_OBJECT_TABLES: dict[str, str] = {
+    object_type: table for object_type, (table, _key) in _UNIT_LINK_TARGETS.items()
+}
+LINKED_OBJECT_KEYS: dict[str, str] = {
+    object_type: key for object_type, (_table, key) in _UNIT_LINK_TARGETS.items()
+}
+EXPLORER_OBJECT_TYPES: dict[str, str] = {
+    table: object_type for object_type, table in LINKED_OBJECT_TABLES.items()
 }
 
 

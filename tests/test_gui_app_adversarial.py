@@ -6,7 +6,9 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from src import dashboard, db
-from src.schemas import CodeArtifact, Conjecture, EvidenceSpan, ExperimentRun, OpenProblem, Paper, ResearchTask, ResearchUnit, Theorem
+from src.schemas import (CodeArtifact, Conjecture, EvidenceSpan, ExperimentRun,
+                         OpenProblem, Paper, ResearchTask, ResearchUnit,
+                         ResearchUnitLink, Theorem)
 
 
 APP_PATH = Path(__file__).parents[1] / "src" / "gui" / "app.py"
@@ -63,9 +65,8 @@ def test_streamlit_pages_and_project_tabs_render_against_populated_database(tmp_
         _switch(app, page)
         assert not app.exception, page
     _switch(app, "Research Tasks")
-    assert {tab.label for tab in app.tabs} == {
-        "Overview", "Known results", "Research frontier", "Literature/evidence", "Experiments", "Timeline"
-    }
+    assert not app.tabs
+    assert _button(app, "open_task_records")
     _switch(app, "System Status")
     assert all("sk-gui-audit-secret" not in str(item.value) for item in app.json)
 
@@ -83,7 +84,7 @@ def test_research_task_gui_shows_units_and_only_two_interventions(tmp_path, monk
         )
     calls = []
 
-    def run_steps(task_id, steps, focus, literature, path):
+    def run_steps(task_id, steps, focus, literature, path, **_kwargs):
         calls.append((task_id, steps, focus, literature, path))
         return {
             "status": "completed", "message": "One step completed.",
@@ -99,7 +100,9 @@ def test_research_task_gui_shows_units_and_only_two_interventions(tmp_path, monk
     assert any("Check finite-memory case" in str(item.value) for item in app.dataframe)
     assert not any(item.key and item.key.startswith("unit_create") for item in app.button)
 
-    next(item for item in app.selectbox if item.key == "unit_work_selector").set_value(unit_id)
+    _button(app, f"unit_focus_{task_id}_{unit_id}").click().run(timeout=5)
+    assert next(item for item in app.selectbox if item.key == "unit_work_selector").value == unit_id
+    assert calls == []
     _button(app, "continue_research").click()
     app.run(timeout=5)
     assert calls[-1] == (task_id, 1, unit_id, False, str(db_path))
@@ -202,8 +205,11 @@ def test_database_explorer_is_read_only_under_filtering_and_selection(tmp_path, 
             "runs": len(db.list_experiment_runs(connection)),
         }
     app = _switch(_app(monkeypatch, db_path), "Database Explorer")
-    app.selectbox[0].set_value("pending_entries")
-    next(item for item in app.text_input if item.label == "Filter rows").set_value("$(no write)")
+    app.segmented_control[0].set_value("Tables")
+    app.run(timeout=5)
+    next(item for item in app.selectbox if item.key == "explorer_table").set_value("pending_entries")
+    app.run(timeout=5)
+    next(item for item in app.text_input if item.key == "explorer_filter").set_value("$(no write)")
     app.run(timeout=5)
     assert not app.exception
     with db.get_connection(db_path) as connection:
@@ -214,13 +220,82 @@ def test_database_explorer_is_read_only_under_filtering_and_selection(tmp_path, 
         }
 
 
+def test_workspace_can_hide_and_reopen_without_losing_page(tmp_path, monkeypatch):
+    db_path = tmp_path / "research.db"
+    _task(db_path)
+    app = _app(monkeypatch, db_path)
+    _button(app, "hide_workspace").click().run(timeout=5)
+    assert not app.exception
+    assert not app.radio
+    assert _button(app, "show_workspace")
+    assert any(item.value == "Research tasks" for item in app.header)
+    _button(app, "show_workspace").click().run(timeout=5)
+    assert not app.exception
+    assert app.radio[0].value == "Research Tasks"
+
+
+def test_unit_and_record_navigation_exposes_linked_result_and_code(tmp_path, monkeypatch):
+    db_path = tmp_path / "research.db"
+    task_id = _task(db_path)
+    with db.get_connection(db_path) as connection:
+        unit_id = db.insert_research_unit(connection, ResearchUnit(
+            task_id=task_id, kind="proof_attempt", title="Inspect reduction",
+            purpose="Compare known bounds", status="finished",
+        ))
+        theorem_id = db.insert_theorem(connection, Theorem(
+            title="Known bound", statement="Finite-state bound", task_id=task_id,
+        ))
+        artifact_id = db.insert_code_artifact(connection, CodeArtifact(
+            name="bounded checker", path="src/brute_solver.py", artifact_type="checker", task_id=task_id,
+        ))
+        db.link_research_unit(connection, ResearchUnitLink(
+            unit_id=unit_id, relation="uses", object_type="theorem", object_id=theorem_id,
+        ))
+        db.link_research_unit(connection, ResearchUnitLink(
+            unit_id=unit_id, relation="produces", object_type="code_artifact", object_id=artifact_id,
+        ))
+    app = _app(monkeypatch, db_path)
+    assert not app.exception
+    assert any("Known bound" in str(item.value) and "bounded checker" in str(item.value)
+               for item in app.dataframe)
+    _switch(app, "Database Explorer")
+    assert not app.exception
+    assert any("Known bound" in str(item.value) for item in app.dataframe)
+    app.segmented_control[0].set_value("Tables")
+    app.run(timeout=5)
+    next(item for item in app.selectbox if item.key == "explorer_table").set_value("theorems")
+    app.run(timeout=5)
+    assert not app.exception
+    linked_unit = next(item for item in app.button
+                       if item.key and item.key.startswith(f"explorer_object_units_theorems_{theorem_id}_"))
+    linked_unit.click().run(timeout=5)
+    assert not app.exception
+    assert app.radio[0].value == "Research Tasks"
+    assert next(item for item in app.selectbox if item.key == f"inspect_unit_{task_id}").value == unit_id
+
+
+def test_task_record_shortcut_opens_first_result_and_raw_table(tmp_path, monkeypatch):
+    db_path = tmp_path / "research.db"
+    task_id = _task(db_path)
+    with db.get_connection(db_path) as connection:
+        db.insert_theorem(connection, Theorem(
+            title="Inspectable result", statement="A recorded theorem", task_id=task_id,
+        ))
+    app = _app(monkeypatch, db_path)
+    _button(app, "open_task_records").click().run(timeout=5)
+    assert not app.exception
+    assert app.radio[0].value == "Database Explorer"
+    assert next(item for item in app.selectbox if item.key == "explorer_task_selector").value == task_id
+    assert any("A recorded theorem" in item.value for item in app.markdown)
+    _button(app, f"task_open_record_{task_id}_theorems").click().run(timeout=5)
+    assert not app.exception
+    assert next(item for item in app.selectbox if item.key == "explorer_table").value == "theorems"
+
+
 @pytest.mark.parametrize("bad_url", ["mysql://localhost/not-supported", "postgresql://localhost:1/unreachable"])
 def test_gui_shows_clear_error_for_invalid_database_urls(tmp_path, monkeypatch, bad_url):
     app = _app(monkeypatch, tmp_path / "healthy-test-schema")
-    _switch(app, "Settings")
-    next(item for item in app.text_input if item.label == "Database URL").set_value(bad_url)
-    next(item for item in app.button if item.label == "Apply database").click()
-    app.run(timeout=5)
+    app.session_state["database_url"] = bad_url
     _switch(app, "Research Tasks")
     assert not app.exception
     assert app.error
@@ -230,7 +305,7 @@ def test_failed_research_run_shows_validation_details_and_log_id(tmp_path, monke
     db_path = tmp_path / "research.db"
     _task(db_path)
 
-    def failed_run(*_args):
+    def failed_run(*_args, **_kwargs):
         return {
             "status": "stopped", "message": "LLM provider JSON failed validation: kind (missing)",
             "research_unit_ids": [], "steps_completed": 0,

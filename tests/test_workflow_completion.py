@@ -6,6 +6,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from src import autonomous_research, dashboard, db
+from src.gui import settings as gui_settings
 from src.autonomous_research import AutonomousResearch
 from src.literature import discovery
 from src.llm import LLMClient, LLMMessage, LLMRequest
@@ -43,8 +44,10 @@ def unit(connection, task_id, title="Earlier work"):
     ))
 
 
-def test_failed_survey_leaves_resumable_unit_without_claims(state, monkeypatch):
+def test_failed_survey_logs_error_without_creating_unit_or_claims(state, monkeypatch):
     path, task_id = state
+    with db.get_connection(path) as connection:
+        parent_id = unit(connection, task_id)
 
     def unavailable(*args):
         raise discovery.LiteratureError("No accessible text", details=({"field": "source", "issue": "HTTP 403"},))
@@ -52,20 +55,48 @@ def test_failed_survey_leaves_resumable_unit_without_claims(state, monkeypatch):
     monkeypatch.setattr(autonomous_research, "discover_full_text", unavailable)
     failed = AutonomousResearch(LLMClient(provider=SequenceProvider([
         _proposal("literature_review", "Read sources"),
-    ])), path).run(task_id)
+    ])), path).run(task_id, unit_id=parent_id, literature_from_unit=True)
     assert failed.status == "stopped" and not failed.unit_ids
-    assert len(failed.blocked_unit_ids) == 1
+    assert failed.blocked_unit_ids == ()
+    assert failed.diagnostic_id
     with db.get_connection(path) as connection:
-        blocked = db.get_research_unit(connection, failed.blocked_unit_ids[0])
-        assert blocked.status == "blocked"
-        assert "No claims stored" in blocked.outcome_note
+        assert [item.unit_id for item in db.list_research_units(connection, task_id)] == [parent_id]
         assert db.list_papers(connection, task_id) == []
+        assert not [event for event in db.list_research_events(connection, task_id)
+                    if event.event_type == "research_step_completed"]
+    logged = json.loads((path.parent / "errors.jsonl").read_text(encoding="utf-8"))
+    assert logged["incident_id"] == failed.diagnostic_id
+    assert logged["error_type"] == "LiteratureError"
     resumed = AutonomousResearch(LLMClient(provider=SequenceProvider([
         _proposal("analysis", "Reformulate question"),
-    ])), path).run(task_id, unit_id=blocked.unit_id)
+    ])), path).run(task_id, unit_id=parent_id)
     assert resumed.status == "completed"
     with db.get_connection(path) as connection:
-        assert db.get_research_unit(connection, resumed.unit_ids[0]).parent_unit_id == blocked.unit_id
+        assert db.get_research_unit(connection, resumed.unit_ids[0]).parent_unit_id == parent_id
+
+
+def test_failed_literature_extraction_does_not_store_paper_or_unit(state, monkeypatch):
+    path, task_id = state
+    paper = discovery.FullTextPaper(
+        "Accessible source", ("Ada",), 2025, "https://example.org/paper",
+        None, None, ("A source passage long enough to inspect.",),
+    )
+    monkeypatch.setattr(autonomous_research, "discover_full_text", lambda *_args: paper)
+
+    def unsupported_claims(*_args):
+        raise discovery.LiteratureError("Unsupported source quotation")
+
+    monkeypatch.setattr(autonomous_research, "extract_source_claims", unsupported_claims)
+    result = AutonomousResearch(LLMClient(provider=SequenceProvider([
+        _proposal("literature_review", "Read source"),
+    ])), path).run(task_id)
+    assert result.status == "stopped"
+    assert result.unit_ids == result.blocked_unit_ids == ()
+    assert result.diagnostic_id
+    with db.get_connection(path) as connection:
+        assert db.list_research_units(connection, task_id) == []
+        assert db.list_papers(connection, task_id) == []
+        assert db.list_theorems(connection, task_id) == []
 
 
 def test_linked_records_beyond_snapshot_cap_reach_continuation(state):
@@ -204,7 +235,7 @@ def test_inaccessible_relevant_paper_does_not_allow_irrelevant_fallback(monkeypa
     assert error.value.details
 
 
-def test_gui_inspector_and_model_routing(state, monkeypatch):
+def test_gui_inspector_uses_saved_api_model(state, monkeypatch):
     path, task_id = state
     with db.get_connection(path) as connection:
         unit_id = unit(connection, task_id)
@@ -216,15 +247,21 @@ def test_gui_inspector_and_model_routing(state, monkeypatch):
 
     monkeypatch.setenv("TEST_DATABASE_URL", db.resolve_database_url())
     monkeypatch.setenv("DATABASE_URL", str(path))
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    monkeypatch.setenv("LLM_PROVIDER", "placeholder")
+    monkeypatch.setattr(gui_settings, "ENV_PATH", path.parent / ".env")
     monkeypatch.setattr(dashboard, "run_research_steps", run)
     app = AppTest.from_file(str(db.PROJECT_ROOT / "src/gui/app.py")).run(timeout=10)
     assert not app.exception
-    assert any("Earlier partial argument" in item.value for item in app.text)
+    assert any("Earlier partial argument" in item.value for item in app.markdown)
     app.radio[0].set_value("Settings").run(timeout=10)
-    next(item for item in app.text_input if item.key == "settings_model_proof_attempt").set_value("reasoner")
-    next(item for item in app.button if item.label == "Apply advanced settings").click().run(timeout=10)
+    next(item for item in app.text_input if item.key == "settings_provider").set_value("OpenAI")
+    next(item for item in app.text_input if item.key == "settings_model").set_value("reasoner")
+    next(item for item in app.text_input if item.key == "settings_api_key").set_value("fake-secret")
+    next(item for item in app.button if item.label == "Save API connection").click().run(timeout=10)
     app.radio[0].set_value("Research Tasks").run(timeout=10)
     next(item for item in app.button if item.key == "continue_research").click()
     app.run(timeout=10)
     assert not app.exception
-    assert calls[-1]["model_overrides"]["proof_attempt"] == "reasoner"
+    assert calls[-1]["client"].configuration.model == "reasoner"
+    assert "model_overrides" not in calls[-1]

@@ -8,6 +8,7 @@ import pytest
 
 from src import autonomous_research, db
 from src.autonomous_research import AutonomousResearch
+from src.literature.discovery import LiteratureError
 from src.llm import LLMClient, LLMResponse
 from src.schemas import CodeArtifact, ResearchTask, ResearchUnit, Theorem
 
@@ -188,6 +189,26 @@ def test_second_step_failure_keeps_only_first_committed_step(research_db):
         results = db.list_derived_results(connection, task_id)
         assert len(results) == 1 and results[0].status == "draft"
         assert len(completed_events(connection, task_id)) == 1
+
+
+def test_failed_literature_second_step_does_not_create_blocked_unit(research_db, monkeypatch):
+    path, task_id = research_db
+
+    def unavailable(*_args, **_kwargs):
+        raise LiteratureError("No accessible full text")
+
+    monkeypatch.setattr(autonomous_research, "discover_full_text", unavailable)
+    provider = RecordingProvider([proposal("analysis"), proposal("literature_review")])
+    result = AutonomousResearch(LLMClient(provider=provider), path).run(task_id, steps=2)
+    assert result.status == "stopped"
+    assert len(result.unit_ids) == 1
+    assert result.blocked_unit_ids == ()
+    assert result.diagnostic_id
+    with db.get_connection(path) as connection:
+        units = db.list_research_units(connection, task_id)
+        assert [item.unit_id for item in units] == list(result.unit_ids)
+        assert len(completed_events(connection, task_id)) == 1
+        assert db.list_papers(connection, task_id) == []
 
 
 def test_failed_unit_insert_rolls_back_provisional_result(research_db, monkeypatch):

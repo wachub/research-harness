@@ -1,10 +1,6 @@
-import json
-import shutil
-import subprocess
+from pathlib import Path
 
-import pytest
-
-from src.gui.unit_graph import GRAPH_JS, KIND_COLORS, graph_data
+from src.gui.unit_graph import KIND_COLORS, graph_data
 
 
 def sample_units():
@@ -29,51 +25,9 @@ def test_types_determine_colours_and_branches_keep_relationships():
     assert data["selected"] == 2
 
 
-def test_frontend_mouse_keyboard_and_selection_sync():
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node is needed for the frontend event-handler test")
-    # Execute the actual inline renderer with a tiny DOM stand-in; no browser or network.
-    harness = r'''
-const assert = require('node:assert/strict');
-class Element {
-  constructor(tag) { this.tag=tag; this.children=[]; this.attrs={}; this.style={}; this.ownerDocument=doc; }
-  setAttribute(k,v) { this.attrs[k]=v; }
-  getAttribute(k) { return this.attrs[k]; }
-  appendChild(child) { this.children.push(child); return child; }
-  replaceChildren(...children) { this.children=children; }
-  querySelector(selector) { return this.children.find(c => '.'+c.attrs.class === selector) || null; }
-}
-const doc = { createElementNS: (_,tag) => new Element(tag), createElement: tag => new Element(tag),
-              createTextNode: value => {const n=new Element('text'); n.textContent=value; return n;} };
-const viewport=new Element('div'), legend=new Element('div'), events=[];
-const component={data:PAYLOAD, parentElement:{querySelector:s=>s==='.viewport'?viewport:legend},
-                 setTriggerValue:(key,value)=>events.push([key,value])};
-const cleanup=render(component);
-let groups=viewport.children[0].children.filter(c=>c.attrs.role==='button');
-assert.equal(groups.length,4);
-groups[1].onclick();
-assert.deepEqual(events.pop(),['clicked',2]);
-assert.equal(groups[1].attrs['aria-pressed'],'true');
-assert.equal(groups[0].attrs['aria-pressed'],'false');
-let prevented=false;
-groups[2].onkeydown({key:'Enter',preventDefault:()=>prevented=true});
-assert.equal(prevented,true);
-assert.deepEqual(events.pop(),['clicked',3]);
-groups[2].onkeydown({key:' ',preventDefault:()=>{}});
-assert.deepEqual(events.pop(),['clicked',3]);
-groups[2].onkeydown({key:'Escape'});
-assert.equal(events.length,0);
-assert.equal(groups[2].children[0].textContent.includes('<script>not code</script>'),true);
-cleanup();
-assert.equal(groups[2].onclick,null);
-component.data.selected=4;
-render(component);
-groups=viewport.children[0].children.filter(c=>c.attrs.role==='button');
-assert.equal(groups[3].attrs['aria-pressed'],'true');
-'''
-    data = graph_data({"name": "Task"}, sample_units(), {}, 1)
-    script = GRAPH_JS.replace("export default function", "const render = function", 1)
-    result = subprocess.run([node, "-"], input=script + harness.replace("PAYLOAD", json.dumps(data)),
-                            text=True, capture_output=True, timeout=10)
-    assert result.returncode == 0, result.stderr
+def test_frontend_is_bundled_locally_without_a_browser_side_cdn():
+    frontend = (Path(__file__).resolve().parents[1] / "components" / "research-unit-graph"
+                / "research_unit_graph" / "frontend")
+    assert len(list((frontend / "build").glob("index-*.js"))) == 1
+    assert '"cytoscape": "^3.34.3"' in (frontend / "package.json").read_text(encoding="utf-8")
+    assert "setTriggerValue(\"clicked\", id)" in (frontend / "src/index.ts").read_text(encoding="utf-8")

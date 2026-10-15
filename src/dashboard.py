@@ -109,12 +109,55 @@ def project_detail(task_id: int, db_path: str | Path | None = None) -> dict[str,
             "open_problems": _dump(db.list_open_problems(connection, task_id=task_id)),
             "proof_attempts": _dump(db.list_proof_attempts(connection, task_id=task_id)),
             "papers": _dump(papers),
+            "models": _dump([item for item in db.list_models(connection) if item.task_id == task_id]),
             "evidence_spans": _dump(evidence),
             "literature_notes": _dump(notes),
             "literature_summaries": _dump(summaries),
             "experiment_runs": _dump(db.list_experiment_runs(connection, task_id=task_id)),
             "code_artifacts": _dump(artifacts),
         }
+
+
+def unit_connections(
+    task_id: int, unit_id: int, db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return the selected unit's typed links with their stored target records."""
+
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        unit = db.get_research_unit(connection, unit_id)
+        if unit is None or unit.task_id != task_id:
+            raise ValueError(f"research unit {unit_id} does not belong to task {task_id}")
+        return [
+            {**link.model_dump(),
+             "table": db.LINKED_OBJECT_TABLES[link.object_type],
+             "record": db.get_linked_research_object(connection, link.object_type, link.object_id)}
+            for link in db.list_research_unit_links(connection, unit_id)
+        ]
+
+
+def object_unit_connections(
+    object_type: str, object_id: int, db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return research units directly linked to one stored object."""
+
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        return [
+            {**link.model_dump(), "unit": unit.model_dump()}
+            for link in db.list_research_units_for_object(connection, object_type, object_id)
+            if (unit := db.get_research_unit(connection, link.unit_id)) is not None
+        ]
+
+
+def object_record(
+    object_type: str, object_id: int, db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """Read a linked record directly, including one older than the explorer page."""
+
+    with db.get_connection(db_path) as connection:
+        db.create_tables(connection)
+        return db.get_linked_research_object(connection, object_type, object_id)
 
 
 

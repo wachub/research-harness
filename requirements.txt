@@ -5,3 +5,4 @@ streamlit>=1.51,<2
 psycopg[binary]>=3.2,<4
 pypdf>=5,<7
 fonttools>=4,<5
+-e ./components/research-unit-graph

@@ -25,9 +25,9 @@ The graph is stored in PostgreSQL, **not Git**.
 The human can let the system choose, force continuation from a particular unit,
 or force a literature survey from that unit. The first step follows that choice;
 subsequent steps choose again. Runs stop on an error and report completed units.
-A failed literature retrieval or quotation check can leave a **blocked unit**,
-without claims, that can be revisited. Provider/schema failures may stop a run
-before any unit is created.
+A failed literature retrieval or quotation check is recorded in the local
+diagnostic log, but creates no research unit or claims. As with provider/schema
+failures, the run stops; earlier completed steps remain stored.
 
 **Finished activity does not mean established result.** Model outputs are drafts
 or unverified. Source-reported claims retain citations and exact evidence quotes.
@@ -61,6 +61,12 @@ python -m streamlit run src/gui/app.py --server.address=127.0.0.1 --server.port=
 Open http://localhost:8501. Go to **Settings**, enter your provider name and API
 key, and save. Then open **Research Tasks**, create an objective, and try **one**
 research step. Larger step counts can make many provider requests.
+
+In **Research Tasks**, select a task and click a research-unit node to inspect
+its activity and directly linked records. **Database Explorer** offers a
+task-oriented view with links between units and stored results, evidence, and
+code artifacts, plus a **Tables** view for raw records. Use **Hide workspace**
+in the sidebar to give the explorer more room; **Show workspace** restores it.
 
 The GUI is a local tool, not an authenticated public service. Do not expose it
 or its credential-entry forms directly to the Internet.
@@ -102,36 +108,22 @@ Use only one local database service on that port.
 
 ## API settings
 
-The main Settings form contains two manually entered fields:
+The GUI's **Settings → API connection** page has three fields: a typed provider
+name (`OpenAI`, `Gemini`, `custom`, or `offline`), an optional model ID, and a
+masked API key. OpenAI and Gemini use compatible endpoints and default models
+(`gpt-4.1-mini` and `gemini-2.5-flash`); these defaults do not guarantee model
+access or research quality. For another OpenAI-compatible service, enter
+`custom`, its model ID, and its HTTPS base URL in **Custom endpoint**. A key is
+never displayed or silently reused for a different endpoint.
 
-- **Provider name**: `OpenAI`, `Gemini`, `offline`, or `custom`.
-- **API key**: masked; existing keys are never prefilled into the widget.
+Saving updates only the four `LLM_*` settings in the local, git-ignored `.env`
+file (mode `0600`), so the connection survives a new GUI session and is also
+available to the CLI. Other `.env` entries are preserved. Saving makes no API
+request; it does not test the key or model. Use the GUI only on a local, private
+server. The database URL and optional per-activity model routing remain
+configurable outside this minimal page.
 
-OpenAI and Gemini fill in a compatible endpoint and a default model:
-`gpt-4.1-mini` and `gemini-2.5-flash`, respectively. These are convenience
-defaults, not promises of free access or sufficient research quality. An
-already configured model is preserved when staying on the same endpoint.
-See the [OpenAI model documentation](https://developers.openai.com/api/docs/models/gpt-4.1-mini)
-and [Gemini compatibility documentation](https://ai.google.dev/gemini-api/docs/openai).
-
-**Advanced** contains manually entered model IDs, the API base URL and optional
-per-activity overrides. There are no provider/model dropdowns or model-list
-requests. For another OpenAI-compatible service (including DeepSeek), configure
-its endpoint/model there, then enter its key with provider `custom`.
-Changing an endpoint clears its old key and activity overrides; a key is never
-silently reused at a different endpoint.
-
-All roles use **one active endpoint and key**, not separate accounts. Blank
-role overrides inherit the research-step model or the literature model, then
-the default model. A configured specialist can develop a selected activity.
-Changing a model name does not enable native web search or a deep-research API.
-
-Settings are **session-only**: page navigation preserves saved settings, but a
-new session or server restart does not. Nothing writes keys to the database or
-`.env`, and opening/saving Settings makes no API request. Reset restores the
-environment configuration. The database connection has its own collapsed section.
-
-For persistent configuration and CLI use, edit `.env` locally:
+The same settings can be configured by editing `.env` locally:
 
 ```dotenv
 DATABASE_URL=postgresql:///research_harness
@@ -311,7 +303,7 @@ A bounded observation is not an unbounded theorem.
 
 | Area | Responsibility |
 | --- | --- |
-| `src/gui/app.py`, `settings.py`, `unit_graph.py` | GUI, session settings, selectable unit graph |
+| `src/gui/app.py`, `settings.py`, `unit_graph.py`; `components/research-unit-graph/` | GUI, settings, and locally bundled interactive unit graph |
 | `src/cli.py`, `dashboard.py` | CLI entry point and GUI-facing application functions |
 | `src/autonomous_research.py` | Current bounded research runner |
 | `src/research_context.py`, `research_actions.py`, `research_units.py` | Scoped context, trusted actions and unit links/results |

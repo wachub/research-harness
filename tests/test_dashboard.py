@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from src import dashboard, db
 from src.llm import LLMClient
-from src.schemas import Conjecture, OpenProblem, Paper, ResearchTask, ResearchUnit
+from src.schemas import (CodeArtifact, Conjecture, Model, OpenProblem, Paper,
+                         ResearchTask, ResearchUnit, ResearchUnitLink)
 from tests.test_autonomous_research import SequenceProvider, _proposal
 
 
@@ -20,6 +21,8 @@ def test_dashboard_summary_and_project_counts_are_scoped(tmp_path):
         db.insert_paper(connection, Paper(title="First paper", authors=["A"], year=2026, task_id=first))
         db.insert_conjecture(connection, Conjecture(statement="First candidate", task_id=first))
         db.insert_open_problem(connection, OpenProblem(title="Second problem", statement="Second", task_id=second))
+        db.insert_model(connection, Model(name="First model", task_id=first))
+        db.insert_model(connection, Model(name="Second model", task_id=second))
 
     summary = dashboard.dashboard_summary(db_path)
     projects = {item["task_id"]: item for item in dashboard.project_summaries(db_path)}
@@ -28,6 +31,7 @@ def test_dashboard_summary_and_project_counts_are_scoped(tmp_path):
     assert projects[first]["conjectures"] == 1
     assert projects[first]["open_problems"] == 0
     assert projects[second]["open_problems"] == 1
+    assert [item["name"] for item in dashboard.project_detail(first, db_path)["models"]] == ["First model"]
 
 
 def test_event_history_includes_direct_research_writes(tmp_path):
@@ -88,3 +92,42 @@ def test_dashboard_run_can_continue_a_selected_unit_without_approval(tmp_path):
         created = db.get_research_unit(connection, output["research_unit_ids"][0])
     assert created.parent_unit_id == second_id != first_id
     assert "pending" not in output
+
+
+def test_unit_connections_resolve_records_and_reverse_links_read_only(tmp_path):
+    db_path = tmp_path / "research.db"
+    task_id = _task(db_path)
+    other_task = _task(db_path, "Other")
+    with db.get_connection(db_path) as connection:
+        unit_id = db.insert_research_unit(connection, ResearchUnit(
+            task_id=task_id, kind="analysis", title="Inspect claim", purpose="Compare evidence",
+        ))
+        paper_id = db.insert_paper(connection, Paper(
+            title="Source", authors=["A"], year=2026, task_id=task_id,
+        ))
+        artifact_id = db.insert_code_artifact(connection, CodeArtifact(
+            name="checker", path="src/brute_solver.py", artifact_type="checker", task_id=task_id,
+        ))
+        db.link_research_unit(connection, ResearchUnitLink(
+            unit_id=unit_id, relation="uses", object_type="paper", object_id=paper_id,
+        ))
+        db.link_research_unit(connection, ResearchUnitLink(
+            unit_id=unit_id, relation="produces", object_type="code_artifact", object_id=artifact_id,
+        ))
+    links = dashboard.unit_connections(task_id, unit_id, db_path)
+    assert [(item["relation"], item["object_type"], item["table"]) for item in links] == [
+        ("produces", "code_artifact", "code_artifacts"),
+        ("uses", "paper", "papers"),
+    ]
+    assert links[0]["record"]["name"] == "checker"
+    assert links[1]["record"]["title"] == "Source"
+    back = dashboard.object_unit_connections("paper", paper_id, db_path)
+    assert [(item["unit_id"], item["unit"]["task_id"]) for item in back] == [(unit_id, task_id)]
+    with db.get_connection(db_path) as connection:
+        assert len(db.list_research_unit_links(connection, unit_id)) == 2
+    try:
+        dashboard.unit_connections(other_task, unit_id, db_path)
+    except ValueError as exc:
+        assert "does not belong" in str(exc)
+    else:
+        raise AssertionError("cross-task unit inspection was accepted")

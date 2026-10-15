@@ -156,26 +156,10 @@ class AutonomousResearch:
                     exc, task_id, index + 1, diagnostics=diagnostics,
                     api_key=self.client.configuration.api_key,
                 )
-                blocked_ids: tuple[int, ...] = ()
-                # Retrieval failure is a real attempted activity. Keep it resumable,
-                # without storing the model's imagined survey outcome or any claims.
-                if isinstance(exc, LiteratureError) and proposal is not None:
-                    try:
-                        with db.get_connection(self.db_path) as connection:
-                            blocked_id = db.insert_research_unit(connection, ResearchUnit(
-                                task_id=task_id, parent_unit_id=parent_id,
-                                kind="literature_review", title=proposal.title,
-                                purpose=proposal.purpose, status="blocked",
-                                outcome_note=f"Literature retrieval/extraction failed. "
-                                             f"No claims stored. Diagnostic: {incident_id or 'unavailable'}.",
-                            ))
-                            blocked_ids = (blocked_id,)
-                    except (ValueError, db.DatabaseError):
-                        pass
                 return ResearchRun(
                     "stopped", f"Stopped after {len(created)} completed steps: {exc}",
                     task_id, tuple(created), type(exc).__name__,
-                    getattr(exc, "details", ()), incident_id, blocked_ids, diagnostics,
+                    getattr(exc, "details", ()), incident_id, (), diagnostics,
                 )
         return ResearchRun("completed", f"Completed {len(created)} research steps.", task_id, tuple(created))
 
