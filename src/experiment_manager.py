@@ -32,7 +32,7 @@ def run_experiment(
     command: str,
     input_path: str | None = None,
     output_path: str | None = None,
-    cluster_id: int | None = None,
+    task_id: int | None = None,
     conjecture_id: int | None = None,
     experiment_type: str | None = None,
     notes: str | None = None,
@@ -67,7 +67,7 @@ def run_experiment(
             connection,
             ExperimentRun(
                 artifact_id=artifact_id,
-                cluster_id=cluster_id,
+                task_id=task_id,
                 conjecture_id=conjecture_id,
                 experiment_type=experiment_type or "manual",
                 input_path=input_path,

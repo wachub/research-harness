@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-unit-graph"
+version = "0.0.1"
+description = "Interactive research-unit graph for Research Harness"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.10"
+authors = [{ name = "Research Harness", email = "noreply@example.invalid" }]
+dependencies = ["streamlit >= 1.51"]
+
+[project.optional-dependencies]
+devel = [
+  "wheel",
+  "pytest==7.4.0",
+  "playwright==1.48.0",
+  "requests==2.31.0",
+  "pytest-playwright-snapshot==1.0",
+  "pytest-rerunfailures==12.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["research_unit_graph*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+research_unit_graph = ["frontend/build/**/*", "pyproject.toml"]

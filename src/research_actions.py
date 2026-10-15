@@ -1,10 +1,10 @@
-"""Strict, finite action vocabulary for the bounded research controller."""
+"""Validated research references and trusted bounded experiment helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import Field
 
@@ -17,13 +17,16 @@ from .schemas import StrictBase
 
 
 ReferenceKind = Literal[
-    "research_cluster",
+    "research_task",
+    "research_unit",
     "concept",
     "paper",
     "theorem",
     "reduction",
     "conjecture",
     "open_problem",
+    "derived_result",
+    "proof_attempt",
     "evidence",
     "experiment_run",
     "code_artifact",
@@ -31,42 +34,10 @@ ReferenceKind = Literal[
 
 
 class ResearchReference(StrictBase):
-    """Reference to an ID supplied in the controller's compact context."""
+    """Reference to an ID supplied in the bounded research context."""
 
     kind: ReferenceKind
     object_id: int = Field(gt=0)
-
-
-class EmptyParameters(StrictBase):
-    """Explicit empty parameter object for read-only actions."""
-
-
-class EvidenceReviewParameters(StrictBase):
-    evidence_ids: list[int] = Field(default_factory=list, max_length=5)
-
-
-class Subquestion(StrictBase):
-    question: str = Field(min_length=1, max_length=500)
-    rationale: str = Field(min_length=1, max_length=1000)
-    uncertainty_note: str = Field(min_length=1, max_length=500)
-
-
-class SubquestionParameters(StrictBase):
-    subquestions: list[Subquestion] = Field(min_length=1, max_length=3)
-
-
-class PendingConjectureParameters(StrictBase):
-    statement: str = Field(min_length=1, max_length=1200)
-    rationale: str = Field(min_length=1, max_length=1000)
-    assumptions: list[str] = Field(default_factory=list, max_length=5)
-    uncertainty_note: str = Field(min_length=1, max_length=500)
-
-
-class PendingOpenProblemParameters(StrictBase):
-    question: str = Field(min_length=1, max_length=1200)
-    rationale: str = Field(min_length=1, max_length=1000)
-    assumptions: list[str] = Field(default_factory=list, max_length=5)
-    uncertainty_note: str = Field(min_length=1, max_length=500)
 
 
 class BoundedExperimentParameters(StrictBase):
@@ -80,109 +51,9 @@ class BoundedExperimentParameters(StrictBase):
     seed: int = Field(default=0, ge=0, le=1_000_000)
 
 
-class ExperimentResultParameters(StrictBase):
-    run_id: int = Field(gt=0)
-
-
-class ReassessPlanParameters(StrictBase):
-    summary: str = Field(min_length=1, max_length=1200)
-    uncertainty_note: str = Field(min_length=1, max_length=500)
-
-
-class ApprovalParameters(StrictBase):
-    """A real existing operation that is deliberately exposed only to block it."""
-
-    pending_id: int = Field(gt=0)
-
-
-class BaseAction(StrictBase):
-    reason: str = Field(min_length=1, max_length=1200)
-    expected_effect: str = Field(min_length=1, max_length=1200)
-    references: list[ResearchReference] = Field(default_factory=list, max_length=8)
-
-
-class InspectStateAction(BaseAction):
-    action_type: Literal["inspect_state"]
-    parameters: EmptyParameters
-
-
-class ReviewStoredEvidenceAction(BaseAction):
-    action_type: Literal["review_stored_evidence"]
-    parameters: EvidenceReviewParameters
-
-
-class ProposeSubquestionsAction(BaseAction):
-    action_type: Literal["propose_subquestions"]
-    parameters: SubquestionParameters
-
-
-class CreatePendingConjectureAction(BaseAction):
-    action_type: Literal["create_pending_conjecture"]
-    parameters: PendingConjectureParameters
-
-
-class CreatePendingOpenProblemAction(BaseAction):
-    action_type: Literal["create_pending_open_problem"]
-    parameters: PendingOpenProblemParameters
-
-
-class DesignBoundedExperimentAction(BaseAction):
-    action_type: Literal["design_bounded_experiment"]
-    parameters: BoundedExperimentParameters
-
-
-class RunTrustedExperimentAction(BaseAction):
-    action_type: Literal["run_trusted_experiment"]
-    parameters: BoundedExperimentParameters
-
-
-class InspectExperimentResultAction(BaseAction):
-    action_type: Literal["inspect_experiment_result"]
-    parameters: ExperimentResultParameters
-
-
-class ReassessPlanAction(BaseAction):
-    action_type: Literal["reassess_plan"]
-    parameters: ReassessPlanParameters
-
-
-class StopAction(BaseAction):
-    action_type: Literal["stop"]
-    parameters: EmptyParameters
-
-
-class ApprovePendingAction(BaseAction):
-    """Included so a high-authority request is paused and recorded, never run."""
-
-    action_type: Literal["approve_pending"]
-    parameters: ApprovalParameters
-
-
-ControllerAction = Annotated[
-    InspectStateAction
-    | ReviewStoredEvidenceAction
-    | ProposeSubquestionsAction
-    | CreatePendingConjectureAction
-    | CreatePendingOpenProblemAction
-    | DesignBoundedExperimentAction
-    | RunTrustedExperimentAction
-    | InspectExperimentResultAction
-    | ReassessPlanAction
-    | StopAction
-    | ApprovePendingAction,
-    Field(discriminator="action_type"),
-]
-
-
-class ControllerDecision(StrictBase):
-    """The LLM must return exactly one typed next action per iteration."""
-
-    action: ControllerAction
-
-
 @dataclass(frozen=True)
 class TrustedExperimentResult:
-    """Result returned by the sole controller-runnable experiment handler."""
+    """Result returned by the trusted bounded experiment handler."""
 
     run_id: int
     summary: str
@@ -191,10 +62,10 @@ class TrustedExperimentResult:
 
 def get_trusted_artifact(
     artifact_id: int,
-    cluster_id: int,
+    task_id: int,
     db_path: str | Path | None = None,
 ) -> CodeArtifact:
-    """Validate controller trust metadata without executing the artifact itself."""
+    """Validate trust metadata without executing the artifact itself."""
 
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
@@ -202,18 +73,19 @@ def get_trusted_artifact(
     if artifact is None:
         raise ValueError(f"code artifact {artifact_id} does not exist")
     if artifact.status != "tested":
-        raise ValueError(f"code artifact {artifact_id} is not trusted for controller execution")
+        raise ValueError(f"code artifact {artifact_id} is not trusted for bounded execution")
     if artifact.artifact_type not in {"checker", "solver"}:
         raise ValueError(f"code artifact {artifact_id} is not a trusted checker or solver")
-    if artifact.cluster_id is not None and artifact.cluster_id != cluster_id:
-        raise ValueError(f"code artifact {artifact_id} belongs to another research cluster")
+    if artifact.task_id is not None and artifact.task_id != task_id:
+        raise ValueError(f"code artifact {artifact_id} belongs to another research task")
     return artifact
 
 
 def run_trusted_bounded_experiment(
     parameters: BoundedExperimentParameters,
-    cluster_id: int,
+    task_id: int,
     db_path: str | Path | None = None,
+    connection: db.PostgresConnection | None = None,
 ) -> TrustedExperimentResult:
     """Run the fixed in-process tiny ATS-family safety handler.
 
@@ -221,7 +93,7 @@ def run_trusted_bounded_experiment(
     and any LLM-provided command text are never executed by this handler.
     """
 
-    get_trusted_artifact(parameters.artifact_id, cluster_id, db_path)
+    get_trusted_artifact(parameters.artifact_id, task_id, db_path)
     game = generate_tiny_game(
         kind=parameters.kind,
         process_count=parameters.process_count,
@@ -237,20 +109,21 @@ def run_trusted_bounded_experiment(
         "counterexample": result.counterexample,
     }
     summary = f"winning={result.winning} checked={result.checked_strategies} depth={result.depth}"
-    with db.get_connection(db_path) as connection:
-        db.create_tables(connection)
-        run_id = db.insert_experiment_run(
-            connection,
-            ExperimentRun(
-                artifact_id=parameters.artifact_id,
-                cluster_id=cluster_id,
-                experiment_type="ats_bounded_safety",
-                input_json=game.to_dict(),
-                output_json=output,
-                result_summary=summary,
-                command_run="trusted_in_process:ats_bounded_safety",
-                git_commit_hash=get_current_commit_hash(),
-                notes="Controller-runnable bounded handler; no artifact command was executed.",
-            ),
-        )
+    record = ExperimentRun(
+        artifact_id=parameters.artifact_id,
+        task_id=task_id,
+        experiment_type="ats_bounded_safety",
+        input_json=game.to_dict(),
+        output_json=output,
+        result_summary=summary,
+        command_run="trusted_in_process:ats_bounded_safety",
+        git_commit_hash=get_current_commit_hash(),
+        notes="Controller-runnable bounded handler; no artifact command was executed.",
+    )
+    if connection is None:
+        with db.get_connection(db_path) as owned_connection:
+            db.create_tables(owned_connection)
+            run_id = db.insert_experiment_run(owned_connection, record)
+    else:
+        run_id = db.insert_experiment_run(connection, record)
     return TrustedExperimentResult(run_id=run_id, summary=summary, output=output)

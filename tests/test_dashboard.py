@@ -1,75 +1,53 @@
 from __future__ import annotations
 
 from src import dashboard, db
-from src.schemas import Conjecture, OpenProblem, Paper, PendingEntry, ResearchCluster
+from src.llm import LLMClient
+from src.schemas import (CodeArtifact, Conjecture, Model, OpenProblem, Paper,
+                         ResearchTask, ResearchUnit, ResearchUnitLink)
+from tests.test_autonomous_research import SequenceProvider, _proposal
 
 
-def _cluster(db_path, name="Dashboard cluster"):
+def _task(db_path, name="Dashboard task"):
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)
-        return db.insert_cluster(connection, ResearchCluster(name=name, status="active"))
+        return db.insert_task(connection, ResearchTask(name=name))
 
 
 def test_dashboard_summary_and_project_counts_are_scoped(tmp_path):
     db_path = tmp_path / "research.db"
-    first = _cluster(db_path, "First")
-    second = _cluster(db_path, "Second")
+    first = _task(db_path, "First")
+    second = _task(db_path, "Second")
     with db.get_connection(db_path) as connection:
-        db.insert_paper(connection, Paper(title="First paper", authors=["A"], year=2026, cluster_id=first))
-        db.insert_conjecture(connection, Conjecture(statement="First candidate", cluster_id=first))
-        db.insert_open_problem(connection, OpenProblem(title="Second problem", statement="Second", cluster_id=second))
+        db.insert_paper(connection, Paper(title="First paper", authors=["A"], year=2026, task_id=first))
+        db.insert_conjecture(connection, Conjecture(statement="First candidate", task_id=first))
+        db.insert_open_problem(connection, OpenProblem(title="Second problem", statement="Second", task_id=second))
+        db.insert_model(connection, Model(name="First model", task_id=first))
+        db.insert_model(connection, Model(name="Second model", task_id=second))
 
     summary = dashboard.dashboard_summary(db_path)
-    projects = {item["cluster_id"]: item for item in dashboard.project_summaries(db_path)}
+    projects = {item["task_id"]: item for item in dashboard.project_summaries(db_path)}
     assert summary["counts"]["papers"] == 1
     assert projects[first]["papers"] == 1
     assert projects[first]["conjectures"] == 1
     assert projects[first]["open_problems"] == 0
     assert projects[second]["open_problems"] == 1
+    assert [item["name"] for item in dashboard.project_detail(first, db_path)["models"]] == ["First model"]
 
 
-def test_event_history_merges_core_writes_and_pending_review(tmp_path):
+def test_event_history_includes_direct_research_writes(tmp_path):
     db_path = tmp_path / "research.db"
-    cluster_id = _cluster(db_path)
+    task_id = _task(db_path)
     with db.get_connection(db_path) as connection:
-        pending_id = db.insert_pending_entry(
-            connection,
-            PendingEntry(
-                entry_type="open_problem",
-                payload=OpenProblem(title="Question", statement="Question", cluster_id=cluster_id).model_dump(),
-            ),
-        )
-    dashboard.approve_review_item(pending_id, db_path)
-    timeline = dashboard.project_timeline(cluster_id, db_path)
+        db.insert_open_problem(connection, OpenProblem(title="Question", statement="Question", task_id=task_id))
+    timeline = dashboard.project_timeline(task_id, db_path)
     event_types = {item["event_type"] for item in timeline}
-    assert {"pending_created", "pending_approved", "open_problem_created"} <= event_types
+    assert "open_problem_created" in event_types
     assert timeline == sorted(timeline, key=lambda item: (item["timestamp"] or "", item["object_type"], item["object_id"] or 0))
-
-
-def test_review_actions_delegate_to_existing_curation_paths(tmp_path):
-    db_path = tmp_path / "research.db"
-    cluster_id = _cluster(db_path)
-    with db.get_connection(db_path) as connection:
-        reject_id = db.insert_pending_entry(
-            connection,
-            PendingEntry(entry_type="conjecture_seed", payload=Conjecture(statement="Reject me", cluster_id=cluster_id).model_dump()),
-        )
-        flag_id = db.insert_pending_entry(
-            connection,
-            PendingEntry(entry_type="conjecture_seed", payload=Conjecture(statement="Flag me", cluster_id=cluster_id).model_dump()),
-        )
-    dashboard.reject_review_item(reject_id, "duplicate", db_path)
-    dashboard.flag_review_item(flag_id, "needs source", db_path)
-    with db.get_connection(db_path) as connection:
-        assert db.get_pending_entry(connection, reject_id).status == "rejected"
-        flagged = db.get_pending_entry(connection, flag_id)
-        assert flagged.status == "flagged"
-        assert any("needs source" in warning for warning in flagged.warnings)
 
 
 def test_explorer_tolerates_malformed_optional_json_and_rejects_unknown_tables(tmp_path):
     db_path = tmp_path / "research.db"
-    _cluster(db_path)
+    _task(db_path)
     with db.get_connection(db_path) as connection:
         connection.execute("INSERT INTO pending_entries (entry_type, payload_json, warnings_json) VALUES (?, ?, ?)", ("paper_summary", "{}", "not-json"))
     rows = dashboard.explorer_records("pending_entries", db_path)
@@ -92,3 +70,64 @@ def test_system_status_never_surfaces_llm_api_key(tmp_path, monkeypatch):
     assert status["remote_llm_available"] is True
     assert "super-secret-value" not in str(status)
     assert "api_key" not in status
+
+
+def test_dashboard_run_can_continue_a_selected_unit_without_approval(tmp_path):
+    db_path = tmp_path / "research.db"
+    task_id = _task(db_path)
+    with db.get_connection(db_path) as connection:
+        first_id = db.insert_research_unit(
+            connection, ResearchUnit(task_id=task_id, kind="question", title="First", purpose="Explore first", status="active"),
+        )
+        second_id = db.insert_research_unit(
+            connection, ResearchUnit(task_id=task_id, kind="question", title="Second", purpose="Explore second", status="active"),
+        )
+
+    output = dashboard.run_research_steps(
+        task_id, unit_id=second_id, db_path=db_path,
+        client=LLMClient(provider=SequenceProvider([_proposal("analysis", "Follow second")])),
+    )
+    assert output["status"] == "completed"
+    with db.get_connection(db_path) as connection:
+        created = db.get_research_unit(connection, output["research_unit_ids"][0])
+    assert created.parent_unit_id == second_id != first_id
+    assert "pending" not in output
+
+
+def test_unit_connections_resolve_records_and_reverse_links_read_only(tmp_path):
+    db_path = tmp_path / "research.db"
+    task_id = _task(db_path)
+    other_task = _task(db_path, "Other")
+    with db.get_connection(db_path) as connection:
+        unit_id = db.insert_research_unit(connection, ResearchUnit(
+            task_id=task_id, kind="analysis", title="Inspect claim", purpose="Compare evidence",
+        ))
+        paper_id = db.insert_paper(connection, Paper(
+            title="Source", authors=["A"], year=2026, task_id=task_id,
+        ))
+        artifact_id = db.insert_code_artifact(connection, CodeArtifact(
+            name="checker", path="src/brute_solver.py", artifact_type="checker", task_id=task_id,
+        ))
+        db.link_research_unit(connection, ResearchUnitLink(
+            unit_id=unit_id, relation="uses", object_type="paper", object_id=paper_id,
+        ))
+        db.link_research_unit(connection, ResearchUnitLink(
+            unit_id=unit_id, relation="produces", object_type="code_artifact", object_id=artifact_id,
+        ))
+    links = dashboard.unit_connections(task_id, unit_id, db_path)
+    assert [(item["relation"], item["object_type"], item["table"]) for item in links] == [
+        ("produces", "code_artifact", "code_artifacts"),
+        ("uses", "paper", "papers"),
+    ]
+    assert links[0]["record"]["name"] == "checker"
+    assert links[1]["record"]["title"] == "Source"
+    back = dashboard.object_unit_connections("paper", paper_id, db_path)
+    assert [(item["unit_id"], item["unit"]["task_id"]) for item in back] == [(unit_id, task_id)]
+    with db.get_connection(db_path) as connection:
+        assert len(db.list_research_unit_links(connection, unit_id)) == 2
+    try:
+        dashboard.unit_connections(other_task, unit_id, db_path)
+    except ValueError as exc:
+        assert "does not belong" in str(exc)
+    else:
+        raise AssertionError("cross-task unit inspection was accepted")

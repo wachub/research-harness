@@ -16,7 +16,7 @@ def add_paper(
     pdf_path: str | None = None,
     url: str | None = None,
     notes: str | None = None,
-    cluster_id: int | None = None,
+    task_id: int | None = None,
     db_path: str | Path | None = None,
 ) -> int:
     """Validate and insert a paper record."""
@@ -29,7 +29,7 @@ def add_paper(
         pdf_path=pdf_path,
         url=url,
         notes=notes,
-        cluster_id=cluster_id,
+        task_id=task_id,
     )
     with db.get_connection(db_path) as connection:
         db.create_tables(connection)

@@ -19,7 +19,7 @@ def test_literature_tables_are_created(tmp_path):
         names = {
             row["name"]
             for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema()"
             ).fetchall()
         }
 

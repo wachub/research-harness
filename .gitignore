@@ -6,6 +6,7 @@ __pycache__/
 data/*.db
 data/*.db-journal
 data/*.json
+data/*.jsonl
 generated/games/*
 generated/counterexamples/*
 results/*
