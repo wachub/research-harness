@@ -141,7 +141,7 @@ class SourceClaim(StrictBase):
     limitations: list[str] = Field(default_factory=list, max_length=20)
     relevance: str | None = Field(default=None, max_length=2000)
     additional_evidence: list[SourceQuote] = Field(default_factory=list, max_length=6)
-    relationship: str = Field(default="new", pattern="^(new|extends|contradicts|possible_duplicate)$")
+    relationship: str = Field(default="new", pattern="^(new|equivalent|extends|special_case|contradicts|possible_duplicate|uncertain)$")
     related_finding: FindingReference | None = None
     relationship_note: str | None = Field(default=None, max_length=2000)
 
@@ -355,6 +355,7 @@ def discover_full_text(
     excluded: set[tuple[str, int]] | None = None,
     client: LLMClient | None = None,
     excluded_keys: set[str] | None = None,
+    search_queries: tuple[str, ...] = (),
 ) -> FullTextPaper:
     """Read one existing local PDF or discover a new openly accessible full text."""
 
@@ -377,16 +378,25 @@ def discover_full_text(
         except LiteratureError:
             continue
 
-    with _literature_stage(trace, "search", host="api.openalex.org",
-                           api_key_configured=bool(os.getenv("OPENALEX_API_KEY", "").strip())) as event:
-        works = _openalex_works(query)
-        event["results_returned"] = len(works)
-        works = [
-            work for work in works
-            if (work.get("display_name"), work.get("publication_year")) not in (excluded or set())
-            and _work_key(work) not in (excluded_keys or set())
-        ]
-        event["candidates_remaining"] = len(works)
+    works: list[dict] = []
+    seen: set[str] = set()
+    # Search the objective and the immediate step separately as well as together.
+    # This expands coverage without making the LLM invent papers or source text.
+    for search_query in dict.fromkeys((query, *search_queries[:2])):
+        if not search_query.strip():
+            continue
+        with _literature_stage(trace, "search", host="api.openalex.org",
+                               api_key_configured=bool(os.getenv("OPENALEX_API_KEY", "").strip())) as event:
+            returned = _openalex_works(search_query)
+            event["results_returned"] = len(returned)
+            for work in returned:
+                key = _work_key(work)
+                if (key in seen or key in (excluded_keys or set())
+                        or (work.get("display_name"), work.get("publication_year")) in (excluded or set())):
+                    continue
+                seen.add(key)
+                works.append(work)
+            event["candidates_remaining"] = len(works)
     if not works:
         raise _retrieval_failure("No new open-access candidates were returned by literature search",
                                  "no_search_candidates", trace)
@@ -478,8 +488,14 @@ def discover_full_text(
 
 
 def _work_key(work: dict) -> str:
-    return digest([work.get("id"), work.get("display_name"), work.get("publication_year"),
-                   work.get("best_oa_location"), work.get("locations")])
+    # Search responses can list different locations for the same work. Discovery
+    # identity must not change merely because OpenAlex reordered those locations.
+    identity = work.get("id") or source_identifier(work.get("doi"))
+    if identity:
+        return digest(["openalex_work", identity])
+    authors = [((entry.get("author") or {}).get("display_name") or "")
+               for entry in work.get("authorships", []) if isinstance(entry, dict)]
+    return digest(["bibliography", work.get("display_name"), work.get("publication_year"), authors])
 
 
 def extract_source_claims(client: LLMClient, paper: FullTextPaper, query: str,
@@ -505,7 +521,6 @@ def extract_source_claims(client: LLMClient, paper: FullTextPaper, query: str,
         prompt = {
             "paper": {"title": paper.title, "authors": paper.authors, "year": paper.year},
             "research_question": query,
-            "existing_findings": existing_findings or [],
             "pages": [{"page": page, "text": content} for page, content in chunk],
             "instruction": (
                 "Distill only relevant explicitly stated theorems, conjectures, open problems or reusable ideas. "
@@ -515,12 +530,23 @@ def extract_source_claims(client: LLMClient, paper: FullTextPaper, query: str,
                 "Copy a contiguous exact supporting quote from the indicated page. "
                 "Use additional_evidence for other passages supporting assumptions or the proof note. "
                 "Summarize any proof as a note, never claim it was verified. "
-                "Compare with existing_findings. Mark extends, contradicts or possible_duplicate only with a supplied "
-                "related_finding {kind, object_id}, and explain the distinction in relationship_note. "
-                "A stronger bound or changed assumptions is a separate claim, not a duplicate. "
                 "Return JSON with claims; use an empty list if none are supported."
             ),
         }
+        if existing_findings:
+            # Keep the standalone extraction API compatible with callers that
+            # explicitly request a bounded comparison during extraction.
+            prompt["existing_findings"] = existing_findings
+            prompt["instruction"] += (
+                " If comparing with supplied existing_findings, mark extends, special_case, "
+                "contradicts or possible_duplicate only with a supplied related_finding "
+                "{kind, object_id}, and explain the distinction in relationship_note."
+            )
+        else:
+            prompt["instruction"] += (
+                " Do not decide whether a claim is new or conflicts with stored knowledge: "
+                "set relationship to new and omit related_finding. Comparison happens separately."
+            )
         with _literature_stage(trace, "extract_claims", chunk=chunk_number, chunks=len(chunks),
                                pages=len(chunk)) as event:
             result = client.complete_json(

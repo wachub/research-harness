@@ -29,6 +29,7 @@ class FakeProvider:
 
 
 def test_configuration_defaults_to_offline_placeholder(monkeypatch):
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)

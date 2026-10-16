@@ -115,6 +115,7 @@ def test_cli_research_demo_smoke(tmp_path, capsys):
 
 
 def test_research_memo_llm_option_falls_back_without_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     db_path = tmp_path / "research.db"

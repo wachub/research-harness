@@ -8,6 +8,7 @@ import pytest
 
 from src import autonomous_research, db
 from src.autonomous_research import AutonomousResearch, StepProposal
+from src.literature import discovery
 from src.literature.discovery import (
     FindingReference, FullTextPaper, LiteratureError, SourceClaim, SourceQuote, extract_source_claims,
 )
@@ -15,7 +16,7 @@ from src.literature.identity import same_paper, source_identifier
 from src.literature.memory import compare_with_existing, completed_ingestion, review_scope, store_distillation
 from src.llm import LLMClient, LLMError
 from src.research_context import load_controller_context
-from src.schemas import Paper, ResearchTask, ResearchUnit, ResearchUnitLink
+from src.schemas import Paper, ResearchTask, ResearchUnit, ResearchUnitLink, Theorem
 from tests.test_autonomous_research import SequenceProvider, _proposal
 
 QUOTE = "Every finite arena has a finite strategy."
@@ -218,7 +219,7 @@ def test_repeat_survey_skips_extraction_then_rechecks_revised_text(state, monkey
     assert runner._survey(state[1], proposal)[1] == [] and not calls
     paper = source(pages=(QUOTE + " Revised proof.",))
     assert runner._survey(state[1], proposal)[1] and len(calls) == 1
-    assert calls[0][3][0]["statement"] == claim().statement
+    assert len(calls[0]) == 3  # extraction gets only the source and question
 
 
 def test_extraction_rejects_invented_relationship_and_extra_quote():
@@ -230,9 +231,11 @@ def test_extraction_rejects_invented_relationship_and_extra_quote():
 
 
 @pytest.mark.parametrize("verdict,expected", [
-    ("equivalent", "possible_duplicate"),
+    ("equivalent", "equivalent"),
     ("extends", "extends"),
+    ("special_case", "special_case"),
     ("contradicts", "contradicts"),
+    ("uncertain", "uncertain"),
     ("different", "new"),
 ])
 def test_model_compares_near_matches_without_silently_merging(state, verdict, expected):
@@ -260,6 +263,84 @@ def test_model_compares_near_matches_without_silently_merging(state, verdict, ex
         assert db.list_theorems(connection)[0].confidence == "pending"
     if expected != "new":
         assert ("theorem", 1, "uses") in links
+
+
+def test_comparison_retrieves_matching_assumptions_beyond_recent_candidates(state):
+    class RecordingProvider(SequenceProvider):
+        def complete(self, request):
+            self.request = request
+            return super().complete(request)
+
+    with db.get_connection(state[0]) as connection:
+        matching_id = db.insert_theorem(connection, Theorem(
+            title="Safety strategies", statement="Finite strategies suffice for global safety",
+            assumptions=["Causal memory"], task_id=state[1],
+        ))
+        for index in range(9):
+            db.insert_theorem(connection, Theorem(
+                title="Safety strategies", statement="Finite strategies suffice for global safety",
+                assumptions=[f"Unrelated information model {index}"], task_id=state[1],
+            ))
+    provider = RecordingProvider([{"comparisons": [{"claim_index": 0, "kind": "theorem",
+        "object_id": matching_id, "verdict": "special_case", "rationale": "Narrower causal-memory assumption"}]}])
+    with db.get_connection(state[0]) as connection:
+        compared = compare_with_existing(connection, state[1], LLMClient(provider=provider), source(),
+                                         [claim(statement="Finite strategies suffice for global safety in causal memory",
+                                                assumptions=["Causal memory"])])
+    offered = json.loads(provider.request.messages[1].content)["comparisons_requested"][0]["stored_candidates"]
+    assert len(offered) == 8
+    assert matching_id in [item["object_id"] for item in offered]
+    assert compared[0].relationship == "special_case"
+
+
+def test_comparison_can_flag_cross_type_relationship_without_merging(state):
+    links, _ = ingest(state, source(), [claim(kind="conjecture")])
+    conjecture_id = next(i for k, i, _ in links if k == "conjecture")
+    provider = SequenceProvider([{"comparisons": [{"claim_index": 0, "kind": "conjecture",
+        "object_id": conjecture_id, "verdict": "contradicts", "rationale": "Opposite outcome"}]}])
+    contrary = "No finite arena has a finite strategy."
+    checked = source(pages=(contrary,), diagnostics={"review_scope": "cross type"})
+    with db.get_connection(state[0]) as connection:
+        compared = compare_with_existing(connection, state[1], LLMClient(provider=provider), checked,
+                                         [claim(statement=contrary, quote=contrary)])
+    assert compared[0].related_finding == FindingReference(kind="conjecture", object_id=conjecture_id)
+    assert compared[0].relationship == "contradicts"
+    ingest(state, checked, compared)
+    with db.get_connection(state[0]) as connection:
+        assert len(db.list_conjectures(connection)) == 1
+        assert len(db.list_theorems(connection)) == 1
+        assert json.loads(db.list_theorems(connection)[0].notes)["distillation"]["relationship"] == "contradicts"
+
+
+def test_comparison_rejects_ambiguous_cross_type_id(state):
+    ingest(state, source(), [claim(), claim(kind="conjecture")])
+    provider = SequenceProvider([{"comparisons": [{"claim_index": 0, "object_id": 1,
+        "verdict": "equivalent", "rationale": "Possibly the same statement"}]}])
+    checked = source(diagnostics={"review_scope": "ambiguous target"})
+    candidate = claim(statement="A related finite-strategy statement")
+    with db.get_connection(state[0]) as connection:
+        compared = compare_with_existing(connection, state[1], LLMClient(provider=provider), checked, [candidate])
+    assert compared == [candidate]
+    assert checked.diagnostics["semantic_comparison"]["status"] == "unavailable"
+
+
+def test_discovery_searches_multiple_queries_but_deduplicates_sources(monkeypatch):
+    work = {"id": "https://openalex.org/W123", "display_name": "Finite safety",
+            "publication_year": 2025, "authorships": [{"author": {"display_name": "Ada"}}],
+            "best_oa_location": {"pdf_url": "https://example.org/paper.pdf"}}
+    queries = []
+    def search(query):
+        queries.append(query)
+        return [work if len(queries) == 1 else {**work, "locations": [{"landing_page_url": "https://example.org/paper"}]}]
+    monkeypatch.setattr(discovery, "_openalex_works", search)
+    monkeypatch.setattr(discovery, "_download_pdf", lambda *_: b"%PDF")
+    monkeypatch.setattr(discovery, "extract_pdf_pages", lambda *_: (QUOTE,))
+    paper = discovery.discover_full_text("finite safety", search_queries=("safety games", "finite safety"))
+    assert queries == ["finite safety", "safety games"]
+    assert paper.title == "Finite safety"
+    assert [event["candidates_remaining"] for event in paper.diagnostics["literature_trace"]
+            if event["stage"] == "search"] == [1, 1]
+    assert paper.diagnostics["literature_trace"][-1]["stage"] == "parse_pdf"
 
 
 def test_untrusted_comparison_id_is_ignored_and_claim_remains(state):
@@ -336,7 +417,7 @@ def test_long_extraction_compares_every_claim_in_bounded_batches(state):
     with db.get_connection(state[0]) as connection:
         compared = compare_with_existing(connection, state[1], client, checked, claims)
     assert len(client.call_metadata) == 2
-    assert all(item.relationship == "possible_duplicate" for item in compared)
+    assert all(item.relationship == "equivalent" for item in compared)
     assert checked.diagnostics["semantic_comparison"]["flagged"] == 7
     assert [item["claims"] for item in checked.diagnostics["semantic_comparison"]["batches"]] == [6, 1]
     assert all(item["elapsed_seconds"] >= 0 for item in checked.diagnostics["semantic_comparison"]["batches"])

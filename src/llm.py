@@ -149,6 +149,17 @@ class LLMMessage:
 
     role: str
     content: str
+    tool_call_id: str | None = None
+    tool_calls: tuple["LLMToolCall", ...] = ()
+
+
+@dataclass(frozen=True)
+class LLMToolCall:
+    """A model-requested function call; arguments remain untrusted JSON."""
+
+    call_id: str
+    name: str
+    arguments: str
 
 
 @dataclass(frozen=True)
@@ -161,6 +172,7 @@ class LLMRequest:
     response_schema: dict[str, Any] | None = None
     model: str | None = None
     model_role: str | None = None
+    tools: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -171,6 +183,7 @@ class LLMResponse:
     provider: str
     model: str
     usage: dict[str, int] = field(default_factory=dict)
+    tool_calls: tuple[LLMToolCall, ...] = ()
 
 
 class LLMProvider(Protocol):
@@ -211,6 +224,8 @@ class LLMConfiguration:
 class OpenAICompatibleProvider:
     """Provider for OpenAI and services implementing its chat-completions API."""
 
+    supports_tools = True
+
     def __init__(
         self,
         *,
@@ -236,11 +251,10 @@ class OpenAICompatibleProvider:
         payload: dict[str, Any] = {
             "model": request.model or self.model,
             "temperature": request.temperature,
-            "messages": [
-                {"role": message.role, "content": message.content}
-                for message in request.messages
-            ],
+            "messages": [self._message_payload(message) for message in request.messages],
         }
+        if request.tools:
+            payload["tools"] = list(request.tools)
         if request.response_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -307,6 +321,19 @@ class OpenAICompatibleProvider:
 
         raise last_error or LLMError("LLM provider request failed")
 
+    @staticmethod
+    def _message_payload(message: LLMMessage) -> dict[str, Any]:
+        result: dict[str, Any] = {"role": message.role, "content": message.content}
+        if message.tool_call_id is not None:
+            result["tool_call_id"] = message.tool_call_id
+        if message.tool_calls:
+            result["tool_calls"] = [
+                {"id": call.call_id, "type": "function",
+                 "function": {"name": call.name, "arguments": call.arguments}}
+                for call in message.tool_calls
+            ]
+        return result
+
     def _request_diagnostics(self, request: LLMRequest) -> dict[str, Any]:
         try:
             host = urllib.parse.urlsplit(self._endpoint).hostname
@@ -327,7 +354,20 @@ class OpenAICompatibleProvider:
             raise LLMError("LLM provider response did not contain a completion choice")
         message = choices[0].get("message")
         content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str) or not content.strip():
+        raw_calls = message.get("tool_calls", []) if isinstance(message, dict) else []
+        if not isinstance(raw_calls, list):
+            raise LLMError("LLM provider returned invalid tool calls")
+        calls: list[LLMToolCall] = []
+        for raw in raw_calls:
+            function = raw.get("function") if isinstance(raw, dict) else None
+            if (not isinstance(raw, dict) or raw.get("type") != "function"
+                    or not isinstance(raw.get("id"), str)
+                    or not isinstance(function, dict)
+                    or not isinstance(function.get("name"), str)
+                    or not isinstance(function.get("arguments"), str)):
+                raise LLMError("LLM provider returned invalid tool calls")
+            calls.append(LLMToolCall(raw["id"], function["name"], function["arguments"]))
+        if (not isinstance(content, str) or not content.strip()) and not calls:
             raise LLMError("LLM provider response did not contain message content")
         raw_usage = data.get("usage", {})
         usage = {
@@ -336,10 +376,11 @@ class OpenAICompatibleProvider:
             if isinstance(value, int)
         } if isinstance(raw_usage, dict) else {}
         return LLMResponse(
-            content=content,
+            content=content or "",
             provider=self.provider_name,
             model=str(data.get("model") or requested_model or self.model),
             usage=usage,
+            tool_calls=tuple(calls),
         )
 
 
@@ -372,6 +413,10 @@ class LLMClient:
     @property
     def available(self) -> bool:
         return self.provider is not None
+
+    @property
+    def supports_tools(self) -> bool:
+        return bool(getattr(self.provider, "supports_tools", False))
 
     @property
     def provider_name(self) -> str:
@@ -442,21 +487,24 @@ class LLMClient:
         """Request JSON and validate it against the caller's Pydantic model."""
 
         if not request.json_mode:
-            request = LLMRequest(
-                messages=request.messages,
-                temperature=request.temperature,
-                json_mode=True,
-                response_schema=request.response_schema,
-                model=request.model,
-                model_role=request.model_role,
-            )
+            request = replace(request, json_mode=True)
         started = time.monotonic()
         response = self.complete(request)
+        return self.validate_json_response(response, request, response_model, started=started)
+
+    def validate_json_response(
+        self, response: LLMResponse, request: LLMRequest,
+        response_model: type[TModel], *, started: float | None = None,
+    ) -> TModel:
+        """Validate a final JSON response after any intervening tool calls."""
+
         diagnostics = {
             **self._request_diagnostics(self._route_model(request)),
             "response_schema": response_model.__name__,
-            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "elapsed_seconds": round(time.monotonic() - started, 3) if started else 0,
         }
+        if response.tool_calls:
+            raise LLMError("LLM requested a tool instead of final JSON", diagnostics=diagnostics)
         try:
             payload = json.loads(_strip_json_fence(response.content))
         except json.JSONDecodeError as exc:

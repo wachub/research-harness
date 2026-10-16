@@ -4,12 +4,13 @@ import json
 import urllib.error
 
 import pytest
+from pydantic import Field
 
-from src import autonomous_research, db
+from src import autonomous_research, db, research_actions
 from src.autonomous_research import AutonomousResearch
 from src.literature.discovery import FullTextPaper, LiteratureError, SourceClaim, _openalex_works, discover_full_text, extract_source_claims
 from src.llm import LLMClient, LLMResponse
-from src.schemas import CodeArtifact, ResearchTask, ResearchUnit
+from src.schemas import CodeArtifact, ResearchTask, ResearchUnit, StrictBase
 
 
 @pytest.fixture(autouse=True)
@@ -107,6 +108,34 @@ def test_literature_step_stores_page_linked_unverified_claim_without_pdf_blob(tm
     assert {link.object_type for link in links} == {"paper", "theorem", "evidence"}
 
 
+def test_partial_result_flags_unverified_source_premise_for_proof_check(tmp_path):
+    from src.literature.memory import store_distillation
+
+    path = tmp_path / "research.db"
+    with db.get_connection(path) as connection:
+        db.create_tables(connection)
+        task_id = db.insert_task(connection, ResearchTask(name="Goal", description="Check finite memory"))
+        paper = FullTextPaper("Source", ("Ada",), 2025, "https://example.org/paper",
+                              None, None, ("Every finite arena has a finite strategy.",))
+        links, _ = store_distillation(connection, task_id, paper, [SourceClaim(
+            kind="theorem", title="Finite strategy", statement="Every finite arena has a finite strategy.",
+            page=1, quote="Every finite arena has a finite strategy.",
+        )])
+        theorem_id = next(ident for kind, ident, _ in links if kind == "theorem")
+    proposal = _proposal("partial_result", "Consequent", "A consequence of the source theorem",
+                         references=[{"kind": "theorem", "object_id": theorem_id}])
+    run = AutonomousResearch(LLMClient(provider=SequenceProvider([proposal])), path).run(task_id)
+    assert run.status == "completed"
+    with db.get_connection(path) as connection:
+        result, = db.list_derived_results(connection, task_id)
+        event = next(item for item in db.list_research_events(connection, task_id)
+                     if item.event_type == "research_step_completed")
+        assert result.status == "draft"
+        assert f"theorem:{theorem_id}" in result.notes
+        assert event.metadata["verification_needed"] == [f"theorem:{theorem_id}"]
+        assert db.list_theorems(connection, task_id)[0].confidence == "pending"
+
+
 def test_failed_unit_creation_rolls_back_literature_claims(tmp_path, monkeypatch):
     path = tmp_path / "research.db"
     with db.get_connection(path) as connection:
@@ -152,6 +181,102 @@ def test_bounded_experiment_is_linked_to_finished_unit_without_claim_promotion(t
         assert db.list_theorems(connection, task_id=task_id) == []
     assert len(runs) == 1
     assert any(link.object_type == "experiment_run" and link.object_id == runs[0].run_id for link in links)
+
+
+def test_registered_non_ats_handler_runs_with_validated_parameters(tmp_path, monkeypatch):
+    class CountingInput(StrictBase):
+        count: int = Field(ge=0, le=10)
+
+    calls = []
+    def count_items(parameters):
+        calls.append(parameters.count)
+        return research_actions.ExperimentOutput(
+            input_json={"count": parameters.count}, output_json={"total": sum(range(parameters.count))},
+            summary=f"summed {parameters.count} terms",
+        )
+
+    monkeypatch.setattr(research_actions, "_HANDLERS", dict(research_actions._HANDLERS))
+    research_actions.register_experiment_handler("finite_sum", research_actions.ExperimentHandler(
+        input_model=CountingInput, run=count_items,
+        artifact_types=frozenset({"experiment_script"}), description="Bounded finite sum.",
+    ))
+    path = tmp_path / "research.db"
+    with db.get_connection(path) as connection:
+        db.create_tables(connection)
+        task_id = db.insert_task(connection, ResearchTask(name="Goal"))
+        artifact_id = db.insert_code_artifact(connection, CodeArtifact(
+            name="Finite sum", path="experiments/not_executed.py", artifact_type="experiment_script",
+            task_id=task_id, status="tested",
+        ))
+    proposal = _proposal("bounded_experiment", "Count finite cases")
+    proposal["experiment"] = {"artifact_id": artifact_id, "handler": "finite_sum",
+                              "parameters": {"count": 5}}
+    run = AutonomousResearch(LLMClient(provider=SequenceProvider([proposal])), path).run(task_id)
+    assert run.status == "completed"
+    assert calls == [5]
+    with db.get_connection(path) as connection:
+        experiment, = db.list_experiment_runs(connection, task_id)
+        assert experiment.experiment_type == "finite_sum"
+        assert experiment.input_json == {"count": 5}
+        assert experiment.output_json == {"total": 10}
+        assert experiment.command_run == "trusted_in_process:finite_sum"
+        assert any(link.object_type == "experiment_run" for link in
+                   db.list_research_unit_links(connection, run.unit_ids[0]))
+
+
+@pytest.mark.parametrize("parameters", [{"count": 11}, {"count": 2, "command": "exit 0"}])
+def test_registered_handler_rejects_invalid_inputs_before_execution(tmp_path, monkeypatch, parameters):
+    class CountingInput(StrictBase):
+        count: int = Field(ge=0, le=10)
+
+    calls = []
+    monkeypatch.setattr(research_actions, "_HANDLERS", dict(research_actions._HANDLERS))
+    research_actions.register_experiment_handler("finite_sum", research_actions.ExperimentHandler(
+        input_model=CountingInput,
+        run=lambda inputs: calls.append(inputs) or research_actions.ExperimentOutput({}, {}, "done"),
+        artifact_types=frozenset({"experiment_script"}), description="Bounded finite sum.",
+    ))
+    path = tmp_path / "research.db"
+    with db.get_connection(path) as connection:
+        db.create_tables(connection)
+        task_id = db.insert_task(connection, ResearchTask(name="Goal"))
+        artifact_id = db.insert_code_artifact(connection, CodeArtifact(
+            name="Finite sum", path="experiments/not_executed.py", artifact_type="experiment_script",
+            task_id=task_id, status="tested",
+        ))
+    proposal = _proposal("bounded_experiment", "Count finite cases")
+    proposal["experiment"] = {"artifact_id": artifact_id, "handler": "finite_sum",
+                              "parameters": parameters}
+    run = AutonomousResearch(LLMClient(provider=SequenceProvider([proposal])), path).run(task_id)
+    assert run.status == "stopped" and not calls
+    with db.get_connection(path) as connection:
+        assert db.list_experiment_runs(connection, task_id) == []
+        assert db.list_research_units(connection, task_id) == []
+
+
+@pytest.mark.parametrize("handler_name,artifact_type", [
+    ("not_registered", "experiment_script"),
+    ("ats_bounded_safety", "experiment_script"),
+])
+def test_autonomous_experiment_rejects_unregistered_or_incompatible_handler(
+    tmp_path, handler_name, artifact_type,
+):
+    path = tmp_path / "research.db"
+    with db.get_connection(path) as connection:
+        db.create_tables(connection)
+        task_id = db.insert_task(connection, ResearchTask(name="Goal"))
+        artifact_id = db.insert_code_artifact(connection, CodeArtifact(
+            name="Not a matching checker", path="experiments/not_executed.py",
+            artifact_type=artifact_type, task_id=task_id, status="tested",
+        ))
+    proposal = _proposal("bounded_experiment", "Try handler")
+    proposal["experiment"] = {"artifact_id": artifact_id, "handler": handler_name,
+                              "parameters": {"kind": "ATS", "depth": 0}}
+    run = AutonomousResearch(LLMClient(provider=SequenceProvider([proposal])), path).run(task_id)
+    assert run.status == "stopped"
+    with db.get_connection(path) as connection:
+        assert not db.list_experiment_runs(connection, task_id)
+        assert not db.list_research_units(connection, task_id)
 
 
 def test_failed_unit_creation_rolls_back_bounded_experiment(tmp_path, monkeypatch):

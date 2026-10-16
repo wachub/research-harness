@@ -34,6 +34,46 @@ or unverified. Source-reported claims retain citations and exact evidence quotes
 They may be working premises, but no general proof verifier exists and the LLM
 cannot mark them verified. No result waits for human approval before storage.
 
+### Research database MCP tools
+
+Proof-attempt development can query stored research state through a local,
+read-only MCP server. It exposes `search_research_records` and
+`get_research_record`; the harness starts it over stdio for the current task,
+and validates the model's tool arguments and final proposal. The model cannot
+choose another task, run SQL, or write through that MCP server. Other research-unit kinds
+still use their existing context flow. This path requires an API model that
+supports OpenAI-compatible tool calls. The server can also be launched for a
+trusted local MCP client with:
+
+```bash
+python -m src.research_mcp --task-id 1
+```
+
+The client must use stdio; this command does not open a network port. Give
+MCP clients access only to tasks whose stored content they may read.
+For this checkout, the project-scoped `.codex/config.toml` connects local Codex
+CLI/IDE sessions to `--all-tasks` mode. That mode additionally
+offers task listing and bounded, allow-listed browsing of the harness's research
+tables. With explicit `--enable-writes`, it also offers two additive tools:
+`add_provisional_conjecture` and `record_proof_attempt`. Each requires a task ID,
+may branch from an existing unit in that task, and atomically creates a new
+finished research unit linked to the provisional conjecture or draft proof
+attempt. The proof target must already be visible in the task. Repeated matching
+submissions return the existing record. These tools cannot approve claims, certify
+proofs, execute SQL, or run experiments. The autonomous proof-attempt server
+remains read-only regardless of Codex configuration.
+
+Write tools are disabled unless the server is started with both `--all-tasks`
+and `--enable-writes`. The local Codex configuration opts in to both tools; remove
+the flag or tool names there to return it to read-only access. By default MCP
+uses the application's `DATABASE_URL`; for a separate constrained PostgreSQL
+credential, set `RESEARCH_HARNESS_MCP_WRITE_DATABASE_URL` in the ignored `.env`.
+That credential needs only the relevant research tables and sequences, not
+administrative privileges. Never commit database credentials or API keys. Codex
+must be running locally in a trusted project with access to the PostgreSQL
+installation. Restart the Codex session or IDE extension after changing MCP
+configuration, then inspect its MCP server list.
+
 ## Quick start
 
 Python 3.11+ and PostgreSQL are required. Run from the repository root:
@@ -149,15 +189,19 @@ local files as research context. Never commit keys, `.env`, or private logs.
 Literature review is implemented by the harness, not by a model's built-in browser:
 
 1. Try local PDFs already attached to the selected task.
-2. Otherwise query OpenAlex for up to five open-access candidates.
+2. Otherwise query OpenAlex with the combined question, the task objective,
+   and the step purpose (up to five results per distinct query). Deduplicate
+   returned sources before selection.
 3. Ask the model to select a relevant source. A unique keyword match may be
    used when the model returns no selection or fails; that failure is recorded.
 4. Try public HTTPS PDF locations, then open HTML article/main text.
 5. Check source identity, extracted-content hash and review scope against prior
    successful distillations. Reuse an unchanged distillation and look for a new
    source; otherwise send extracted text in bounded chunks to the LLM.
-6. Validate structured claims and require an **exact quote** on the supplied
-   page/HTML section before storing anything.
+6. Distil structured, source-reported claims without asking the extraction model
+   to decide novelty. Require an **exact quote** on the supplied page/HTML
+   section. Separately compare each nonexact claim with stored findings before
+   storing it.
 
 ### Distilled memory and repeat reviews
 
@@ -186,12 +230,14 @@ Repeat intake uses conservative identities:
   purpose is eligible for another extraction; a review with no findings is not
   marked successfully distilled. Retrieval may still occur to detect revisions.
 
-The extraction model sees bounded task findings. A separate comparison request
-then checks each nonexact new claim against up to six relevant stored findings
-of the same kind, including cross-task findings. Its structured verdict considers
-mathematical scope, assumptions, objectives and bounds. Suggested equivalence is
-saved as `possible_duplicate`; extensions and contradictions retain their target
-reference and explanation. These are **unverified relationships**. A malformed or
+The extraction model sees the selected source text, not database findings. A
+separate comparison request checks each nonexact claim against up to eight
+stored candidates, including cross-task and cross-type findings. Candidate
+ranking uses both statement/topic words and explicit assumptions or scope.
+The comparison considers mathematical scope, objectives and bounds, and records
+`equivalent`, `special_case`, `extends`, `contradicts`, or `uncertain` with a
+target reference and explanation. These are **unverified relationships**, not
+admission rules or automatic merges; contradictory claims are retained. A malformed or
 unavailable comparison leaves the supported new claim intact. This can flag
 paraphrases that string matching misses, but it cannot prove mathematical
 equivalence: such claims stay separate until the distinction is resolved. Exact
@@ -199,7 +245,10 @@ matching remains the only automatic merge. No existing rows are deleted or
 retroactively merged. Literature writes and checkpoint creation are transactional,
 with a PostgreSQL advisory lock protecting concurrent intake. This behavior belongs
 to the autonomous literature path; legacy/manual claim insertion is not globally
-deduplicated. No schema migration is required.
+deduplicated. The comparison is bounded, so it can still miss a related finding.
+When a draft partial result explicitly cites an unverified source-reported finding,
+its notes and timeline event flag that source proof as needing verification. The
+harness does not yet verify general proofs automatically. No schema migration is required.
 
 OpenAlex access is separate from LLM access. `OPENALEX_API_KEY` is optional
 configuration for discovery, not your OpenAI/Gemini key. Access and rate limits
@@ -293,8 +342,16 @@ python -m src.cli generate-game --kind ATS --processes 2 --states 2 --seed 7 --o
 python -m src.cli brute-check --input generated/games/tiny.json --depth 5
 ```
 
-Autonomous experiment steps can use only the existing trusted, tested checker
-artifact under explicit bounds. Manual `register-code-artifact` and
+Autonomous experiment steps use code-registered handlers, each with a Pydantic
+input schema, compatible tested artifact types and bounded structured output.
+The built-in tiny ATS/CDM/2DM checker is currently the only production handler;
+the controller is no longer tied to that domain. Another research domain can add
+a reviewed handler in Python and register it without changing the controller or
+database schema. The LLM can select a listed handler and propose its inputs, but
+cannot supply a command, import path or executable artifact code. Handler code
+must itself enforce computational bounds; this in-process registry is not a
+sandbox for untrusted user programs, and database rollback cannot undo a
+handler's external side effects. Manual `register-code-artifact` and
 `run-experiment` commands record paths, commands, Git revisions, outputs and
 summaries; the latter executes the command you explicitly supply.
 A bounded observation is not an unbounded theorem.
